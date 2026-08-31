@@ -25,5 +25,11 @@ def replay_history(bandit: ContextualBandit, engine, mode: str) -> None:
         ).all()
 
     for row in rows:
+        if row.model not in bandit.arms:
+            # a model that was live when this row was logged but has
+            # since been retired or renamed by ARC. no arm to credit the
+            # reward to anymore, skip it rather than crash the whole
+            # replay over one stale row.
+            continue
         context_key = f"{row.task_type}:{row.length_bucket}"
         bandit.update(context_key, row.model, row.reward)

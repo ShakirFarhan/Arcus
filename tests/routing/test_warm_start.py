@@ -73,6 +73,28 @@ def test_replay_history_ignores_other_modes():
     assert underlying._pulls == {"gpt-oss-120b": 0, "GLM-5.3": 0}
 
 
+def test_replay_history_skips_rows_for_a_retired_model():
+    engine = _in_memory_engine()
+
+    # a model that was live when this row got logged but isn't one of
+    # the bandit's current arms anymore (ARC renamed or dropped it)
+    log_request(
+        prompt="p1", task_type="code", length_bucket="short", model="some-old-retired-model",
+        mode="bandit", reward=0.9, engine=engine,
+    )
+    log_request(
+        prompt="p2", task_type="code", length_bucket="short", model="gpt-oss-120b",
+        mode="bandit", reward=0.7, engine=engine,
+    )
+
+    bandit = ContextualBandit(_factory, arms=ARMS)
+    replay_history(bandit, engine, mode="bandit")  # should not raise
+
+    underlying = bandit._get_bandit("code:short")
+    assert underlying._pulls == {"gpt-oss-120b": 1, "GLM-5.3": 0}
+    assert underlying._reward_sums["gpt-oss-120b"] == 0.7
+
+
 def test_replay_history_keeps_contexts_separate():
     engine = _in_memory_engine()
 
