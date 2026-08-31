@@ -1,0 +1,33 @@
+[project]
+name = "arcus"
+version = "0.1.0"
+description = "Adaptive routing, a quality gate, and a correctness-aware cache on top of Virginia Tech ARC's LLM API"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+    "openai",
+    "platformdirs>=4.11.3",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "rich>=15.0.0",
+    "sentence-transformers>=6.0.0",
+    "sqlmodel>=0.0.39",
+    "typer>=0.27.1",
+]
+
+[project.scripts]
+arcus = "arcus.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arcus"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
