@@ -40,6 +40,20 @@ def test_save_config_sets_restrictive_permissions(tmp_path):
     assert mode == 0o600
 
 
+def test_save_config_skips_chmod_on_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr("arcus.config.os.name", "nt")
+
+    def _boom(self, mode):
+        raise AssertionError("chmod shouldn't be called on Windows")
+
+    monkeypatch.setattr("pathlib.Path.chmod", _boom)
+
+    path = tmp_path / "config.toml"
+    save_config(ArcusConfig(arc_api_key="sk-test-123"), path=path)
+
+    assert path.read_text().startswith('arc_api_key')
+
+
 def test_save_config_creates_parent_dir(tmp_path):
     path = tmp_path / "nested" / "config.toml"
     save_config(ArcusConfig(arc_api_key="sk-test-123"), path=path)

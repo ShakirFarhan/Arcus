@@ -1,3 +1,4 @@
+import os
 import tomllib
 from pathlib import Path
 from typing import Literal
@@ -42,5 +43,10 @@ def save_config(config: ArcusConfig, path: Path | None = None) -> None:
         f'bandit_algorithm = "{config.bandit_algorithm}"\n'
     )
     # the API key lives on disk in plain text, chmod 600 so it's at least
-    # not readable by other users on the same machine.
-    path.chmod(0o600)
+    # not readable by other users on the same machine. skipped on
+    # Windows, where chmod only toggles the read-only attribute and
+    # doesn't map onto per-user access control the way it does on POSIX,
+    # the per-user profile directory Windows resolves config_path() into
+    # already isn't readable by other accounts by default.
+    if os.name != "nt":
+        path.chmod(0o600)
