@@ -174,11 +174,17 @@ arms than picking blindly would.
 
 ## Install
 
-Not yet published to PyPI. To run it locally:
+```bash
+pip install arcus-cli
+# or, with uv
+uv tool install arcus-cli
+```
+
+Or run from source:
 
 ```bash
-git clone <this repo>
-cd arcus
+git clone https://github.com/ShakirFarhan/Arcus.git
+cd Arcus
 uv sync
 uv run arcus "explain how binary search works"
 ```

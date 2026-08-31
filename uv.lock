@@ -33,7 +33,7 @@ wheels = [
 ]
 
 [[package]]
-name = "arcus"
+name = "arcus-cli"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

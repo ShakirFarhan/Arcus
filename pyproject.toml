@@ -1,10 +1,22 @@
 [project]
-name = "arcus"
+name = "arcus-cli"
 version = "0.1.0"
 description = "Adaptive routing, a quality gate, and a correctness-aware cache on top of Virginia Tech ARC's LLM API"
 readme = "README.md"
 license = "MIT"
+authors = [{ name = "Shakir Farhan" }]
 requires-python = ">=3.13"
+keywords = ["llm", "cli", "routing", "bandit", "arc", "virginia-tech"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
 dependencies = [
     "openai",
     "platformdirs>=4.11.3",
@@ -15,6 +27,11 @@ dependencies = [
     "sqlmodel>=0.0.39",
     "typer>=0.27.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ShakirFarhan/Arcus"
+Repository = "https://github.com/ShakirFarhan/Arcus"
+Issues = "https://github.com/ShakirFarhan/Arcus/issues"
 
 [project.scripts]
 arcus = "arcus.cli:main"
