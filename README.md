@@ -1,5 +1,10 @@
 # Arcus
 
+[![CI](https://github.com/ShakirFarhan/Arcus/actions/workflows/ci.yml/badge.svg)](https://github.com/ShakirFarhan/Arcus/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/arcus-cli.svg)](https://pypi.org/project/arcus-cli/)
+[![Python](https://img.shields.io/pypi/pyversions/arcus-cli.svg)](https://pypi.org/project/arcus-cli/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
 A CLI that sits on top of Virginia Tech ARC's LLM API and makes it
 smarter: it picks which of ARC's four open-weight models to route a
 request to, checks the response before handing it back to you, and
