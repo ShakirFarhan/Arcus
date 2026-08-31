@@ -1,0 +1,47 @@
+name: Bug report
+description: Something in arcus isn't working as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you run, and what went wrong?
+      placeholder: |
+        Ran `arcus "..."` and got a traceback / wrong answer / hang, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: arcus-cli version
+      description: Output of `pip show arcus-cli` or `uv tool list`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which mode were you using?
+      options:
+        - "arcus \"...\" (one-shot)"
+        - "arcus chat"
+        - "arcus stats"
+        - "arcus --random"
+        - Not sure / other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Full error output, if any
+      render: shell
