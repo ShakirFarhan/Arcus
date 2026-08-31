@@ -58,6 +58,19 @@ def test_chat_forwards_model_and_messages(monkeypatch, model):
     assert result == "fake completion"
 
 
+def test_list_models_returns_ids(monkeypatch):
+    monkeypatch.setenv("ARC_API_KEY", "env-key")
+    adapter = ArcAdapter()
+
+    class _Model:
+        def __init__(self, id_):
+            self.id = id_
+
+    adapter._client.models.list = lambda: [_Model("gpt-oss-120b"), _Model("GLM-5.3-thinking-high")]
+
+    assert adapter.list_models() == ["gpt-oss-120b", "GLM-5.3-thinking-high"]
+
+
 def test_chat_passes_through_extra_kwargs(monkeypatch):
     monkeypatch.setenv("ARC_API_KEY", "env-key")
     adapter = ArcAdapter()

@@ -1,5 +1,6 @@
 import sys
 import threading
+from importlib.metadata import PackageNotFoundError, version
 from uuid import uuid4
 
 import typer
@@ -22,16 +23,36 @@ from arcus.routing.bandit import (
     UCB1Bandit,
 )
 from arcus.routing.context import Context, classify
+from arcus.routing.model_catalog import known_arms
 from arcus.routing.warm_start import replay_history
 from arcus.storage.db import RequestLog, get_engine, log_request
 from arcus.storage.stats import aggregate_by_arm_and_mode
-
-ARMS = [m.value for m in ArcModel]
 
 _ALGORITHM_FACTORIES: dict[BanditAlgorithm, "type[Bandit]"] = {
     "epsilon_greedy": EpsilonGreedyBandit,
     "ucb1": UCB1Bandit,
     "thompson": ThompsonSamplingBandit,
+}
+
+_COMPLETION_SCRIPTS = {
+    "bash": """\
+_arcus_completions() {
+    local cur=${COMP_WORDS[COMP_CWORD]}
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "chat stats --random --version" -- "$cur"))
+    fi
+}
+complete -F _arcus_completions arcus
+""",
+    "zsh": """\
+#compdef arcus
+_arcus() {
+    if [ "$CURRENT" -eq 2 ]; then
+        compadd chat stats --random --version
+    fi
+}
+_arcus
+""",
 }
 
 
@@ -44,6 +65,15 @@ def main(argv: list[str] | None = None) -> None:
     the one reserved word, everything else is prompt text.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    if argv and argv[0] in ("--version", "-V"):
+        Console().print(f"arcus {_version()}")
+        return
+
+    if argv and argv[0] == "--completion":
+        shell = argv[1] if len(argv) > 1 else ""
+        _print_completion(shell)
+        return
 
     if argv and argv[0] == "stats":
         run_stats()
@@ -81,6 +111,29 @@ def _build_prompt(args: list[str]) -> str:
 
 def _print_usage() -> None:
     Console().print('usage: arcus "<question>"   or   arcus chat   or   arcus stats')
+
+
+def _version() -> str:
+    try:
+        return version("arcus-cli")
+    except PackageNotFoundError:
+        # running straight from a checkout rather than an installed
+        # package, there's no distribution metadata to read
+        return "unknown (running from source)"
+
+
+def _print_completion(shell: str) -> None:
+    script = _COMPLETION_SCRIPTS.get(shell)
+    if script is None:
+        Console().print(
+            f"[red]no completion script for '{shell}', supported shells: "
+            f"{', '.join(_COMPLETION_SCRIPTS)}[/red]"
+        )
+        raise SystemExit(1)
+    # plain print rather than console.print, this output gets piped
+    # straight into eval by the shell and needs to stay free of rich's
+    # formatting and color codes
+    print(script)
 
 
 def _ensure_config() -> ArcusConfig:
@@ -160,8 +213,9 @@ def run_ask(prompt: str, random_mode: bool = False) -> None:
         )
         return
 
+    arms = known_arms(adapter)
     algorithm_factory = RandomBandit if random_mode else _ALGORITHM_FACTORIES[config.bandit_algorithm]
-    bandit = ContextualBandit(lambda: algorithm_factory(ARMS), arms=ARMS)
+    bandit = ContextualBandit(lambda: algorithm_factory(arms), arms=arms)
     # rebuild what this bandit already learned from past requests in this
     # same mode, otherwise every invocation starts back at zero since
     # there's no daemon holding it in memory between runs.
@@ -243,8 +297,9 @@ def run_chat(random_mode: bool = False) -> None:
     threading.Thread(target=get_embedding_model, daemon=True).start()
 
     mode = "random" if random_mode else "bandit"
+    arms = known_arms(adapter)
     algorithm_factory = RandomBandit if random_mode else _ALGORITHM_FACTORIES[config.bandit_algorithm]
-    bandit = ContextualBandit(lambda: algorithm_factory(ARMS), arms=ARMS)
+    bandit = ContextualBandit(lambda: algorithm_factory(arms), arms=arms)
     replay_history(bandit, engine, mode=mode)
 
     conversation_id = str(uuid4())

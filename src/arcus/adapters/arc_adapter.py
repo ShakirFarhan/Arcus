@@ -6,7 +6,13 @@ from openai.types.chat import ChatCompletion
 
 
 class ArcModel(str, Enum):
-    """The four models ARC currently exposes."""
+    """The four models this build knows how to route to and has cost/
+    reward data for. ARC maintains its own catalog independently of this
+    project and can add, remove, or rename entries at any time, so
+    treat this as a snapshot rather than a guarantee, see
+    routing/model_catalog.py for how the router cross-checks it against
+    what ARC is actually serving.
+    """
 
     GPT_OSS_120B = "gpt-oss-120b"
     GLM_5_3 = "GLM-5.3"
@@ -66,3 +72,9 @@ class ArcAdapter:
             messages=messages,
             **kwargs,
         )
+
+    def list_models(self) -> list[str]:
+        """Model ids ARC is actually serving right now, straight from its
+        catalog endpoint rather than anything hardcoded on our side.
+        """
+        return [entry.id for entry in self._client.models.list()]

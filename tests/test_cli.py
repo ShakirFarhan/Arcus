@@ -23,6 +23,18 @@ def _no_real_embedding_load(monkeypatch):
     monkeypatch.setattr(cli, "get_embedding_model", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def _fake_known_arms(monkeypatch):
+    # known_arms() normally checks ARC's live model catalog against
+    # disk cache, neither of which a unit test should be touching. tests
+    # that care about routing behavior mock call_with_quality_gate
+    # directly anyway, so the exact arm list here doesn't matter beyond
+    # being non-empty and consistent with what those mocks expect.
+    monkeypatch.setattr(
+        cli, "known_arms", lambda adapter: ["gpt-oss-120b", "GLM-5.3", "Kimi-K3", "DeepSeek-V4-Flash"]
+    )
+
+
 def _mock_completion(content, finish_reason="stop"):
     class Message:
         pass
@@ -440,6 +452,44 @@ def test_run_stats_handles_empty_log(monkeypatch, capsys):
     cli.run_stats()
 
     assert "no requests logged" in capsys.readouterr().out
+
+
+def test_main_prints_version(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_version", lambda: "1.2.3")
+    cli.main(["--version"])
+    assert "1.2.3" in capsys.readouterr().out
+
+
+def test_main_prints_version_with_short_flag(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_version", lambda: "1.2.3")
+    cli.main(["-V"])
+    assert "1.2.3" in capsys.readouterr().out
+
+
+def test_version_falls_back_when_not_installed(monkeypatch):
+    def _raise(name):
+        raise cli.PackageNotFoundError(name)
+
+    monkeypatch.setattr(cli, "version", _raise)
+    assert "source" in cli._version()
+
+
+def test_main_dispatches_to_completion(monkeypatch, capsys):
+    cli.main(["--completion", "zsh"])
+    out = capsys.readouterr().out
+    assert "compdef" in out
+
+
+def test_completion_supports_bash(capsys):
+    cli.main(["--completion", "bash"])
+    out = capsys.readouterr().out
+    assert "complete -F" in out
+
+
+def test_completion_rejects_an_unknown_shell(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--completion", "fish"])
+    assert "no completion script" in capsys.readouterr().out
 
 
 def test_main_dispatches_to_stats(monkeypatch):

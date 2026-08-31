@@ -102,6 +102,15 @@ by replaying the local request log, which works because a bandit's
 `update()` is just an associative accumulation of pull counts and reward
 sums.
 
+The four model ids arcus routes to live in `ArcModel`, but ARC runs its
+own model catalog independently and can rename or retire an entry at
+any time. `src/arcus/routing/model_catalog.py` checks the configured
+list against what ARC is actually serving (cached for a few hours so
+this doesn't cost a network round trip on every call) and quietly drops
+anything that's no longer live, rather than routing to a model
+guaranteed to fail. Local history logged under a since-renamed model id
+is skipped the same way when the bandit's state gets rebuilt.
+
 ### Quality gate
 
 Five independent checks run over every response: truncation
@@ -200,6 +209,17 @@ First run walks you through a one-time setup: it asks for your ARC key
 `~/.config/arcus/config.toml` with `chmod 600`. No separate setup
 command to remember.
 
+For tab completion on the `chat`/`stats`/`--random` words, add one of
+these to your shell config:
+
+```bash
+# zsh, in ~/.zshrc
+eval "$(arcus --completion zsh)"
+
+# bash, in ~/.bashrc
+eval "$(arcus --completion bash)"
+```
+
 ## Usage
 
 ```bash
@@ -220,6 +240,9 @@ arcus stats
 
 # hold a multi-turn conversation instead of a single question
 arcus chat
+
+# check which version is installed
+arcus --version
 ```
 
 `arcus chat` opens a REPL that remembers everything said earlier in that
