@@ -19,7 +19,10 @@ arcus "explain how binary search works"
 
 ARC gives every VT user free access to four open-weight models
 (gpt-oss-120b, GLM-5.3, Kimi-K3, DeepSeek-V4-Flash) through one
-OpenAI-compatible endpoint. Picking a model by hand every time is
+OpenAI-compatible endpoint ([ARC's own docs](https://www.docs.arc.vt.edu/ai/011_llm_api_arc_vt_edu.html)
+cover the service itself, including its rate limits and data-handling
+approval, arcus is a client built on top of it, not affiliated with
+ARC). Picking a model by hand every time is
 tedious, and a plain HTTP 200 doesn't tell you whether the response
 inside it was actually any good, a truncated answer or a flat refusal
 comes back looking the same as a correct one unless something reads the
@@ -121,6 +124,17 @@ negative reward for that model in that context and retries with a
 different one, up to once per available arm, before giving up and
 returning the last attempt. See `src/arcus/quality/gate.py`.
 
+ARC caps concurrent requests per account rather than per model, so a
+429 doesn't mean the model that was just called is bad, switching to a
+different arm wouldn't help either. A rate limit gets a few short
+retries against the same model before it's treated as a real failure,
+so one busy moment doesn't unfairly tank that model's learned reward.
+
+Similarly, ARC's access restriction (see Install below) applies to the
+whole account, not one model, so hitting it stops the request
+immediately with a clear message instead of cycling through every arm
+against the same wall, and doesn't count against any model's reward.
+
 ### Semantic cache
 
 Local `sentence-transformers` embeddings (`all-MiniLM-L6-v2`), cosine
@@ -209,6 +223,11 @@ First run walks you through a one-time setup: it asks for your ARC key
 `~/.config/arcus/config.toml` with `chmod 600`. No separate setup
 command to remember.
 
+ARC restricts the API to VT's campus network, so this (and every
+`arcus` call after it) needs either an on-campus connection or VT's
+VPN. Arcus surfaces this as a clear message rather than the generic
+"no usable response" error when it happens.
+
 For tab completion on the `chat`/`stats`/`--random` words, add one of
 these to your shell config:
 
@@ -238,8 +257,22 @@ arcus --random "explain how binary search works"
 # see how it's doing
 arcus stats
 
+# see every model ARC is currently serving, and which ones arcus routes to
+arcus models
+
 # hold a multi-turn conversation instead of a single question
 arcus chat
+
+# save the conversation to a file when you leave
+arcus chat --save transcript.md
+
+# ask about an image (routes to Kimi-K3, the one ARC model documented
+# as vision-capable)
+arcus --image screenshot.png "what's wrong with this code?"
+
+# view or change local settings
+arcus config
+arcus config set bandit_algorithm ucb1
 
 # check which version is installed
 arcus --version
@@ -250,7 +283,23 @@ session (resending the growing transcript each turn, since ARC's API has
 no session concept of its own) and routes each turn through the same
 bandit/quality-gate/logging pipeline as a one-shot `arcus "..."` call.
 Type `exit` or press ctrl-d to leave. The conversation only lives for
-that one run, closing the terminal loses it.
+that one run, closing the terminal loses it, unless you pass `--save
+<path>`, which writes the full transcript (not just whatever's still in
+the trimmed context window) to a markdown file when you exit.
+
+`arcus --image <path> "question"` attaches an image to a one-shot
+question. It always goes to Kimi-K3 rather than through the usual
+bandit comparison, since that's the only one of the four models ARC's
+own docs describe as vision-capable, the others aren't confirmed either
+way. Skips the semantic cache entirely too, matching on the question
+text alone would risk serving back an answer about a completely
+different image. Not available in `arcus chat` yet, one-shot only.
+
+`arcus config` shows your current settings (the API key masked) and the
+path to the config file. `arcus config set bandit_algorithm <algo>`
+changes which bandit algorithm arcus uses without hand-editing the TOML
+file. Re-keying isn't supported here on purpose, delete the config file
+and run `arcus` again to go through setup fresh.
 
 `arcus stats` reads your local SQLite log and prints a `rich`-formatted
 table: request count, average reward, average latency, and cost score
@@ -262,15 +311,16 @@ quality gate has caught and retried. Entirely local, no network call.
 Everything described above is implemented and working: the ARC adapter,
 context classification, all three bandit algorithms with propensity
 tracking, the reward function, the quality gate, the semantic cache and
-its benchmark, the CLI (ask command, chat mode, first-run wizard, error
-piping, stats), and the offline evaluation + regret benchmarking layer.
+its benchmark, the CLI (ask command, chat mode with transcript export,
+image input, a config command, first-run wizard, error piping, stats,
+models), and the offline evaluation + regret benchmarking layer.
 
 Verified live against a real ARC key: all four models respond correctly
 (`tests/adapters/test_arc_adapter_live.py`), and a full end-to-end
 `arcus "..."` run exercises the whole pipeline (context classification,
 cache miss, bandit routing, a real ARC call, the quality gate, logging,
-and caching the result) against real traffic. Test suite: 178 passing
-with a key set (174 plus 4 live-only tests), 4 skipped without one.
+and caching the result) against real traffic. Test suite: 223 passing
+with a key set (219 plus 4 live-only tests), 4 skipped without one.
 
 Worth knowing: ARC's models are reasoning models under the hood, they
 write to a hidden `reasoning` field before `content`, so a small
@@ -282,11 +332,15 @@ budget of your own.
 
 What's still open:
 
-- Not published to PyPI yet.
 - Real logged usage is still thin (a handful of manual runs). Once
   there's a real query history, `arcus/eval/offline.py`'s
   `evaluate_policies()` is what turns it into the comparison table
   described above.
+- Image input's request-building and error handling are unit tested,
+  but haven't been confirmed against a real vision response from ARC
+  yet.
+- Image input is one-shot only, `arcus chat` doesn't support attaching
+  one mid-conversation.
 
 ## Security & privacy
 

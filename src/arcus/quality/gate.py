@@ -2,13 +2,33 @@ import re
 import time
 from dataclasses import dataclass
 
-from openai import APIError
+from openai import APIError, PermissionDeniedError, RateLimitError
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ValidationError
 
 from arcus.adapters.arc_adapter import ArcAdapter
 from arcus.routing.bandit import ContextualBandit
 from arcus.routing.reward import compute_reward
+
+# ARC enforces a per-account concurrent-request cap, not a per-model
+# one, so a 429 says nothing about whether the model that was just
+# called is any good. worth a few short retries against the same arm
+# before treating it like an actual failure of that model.
+_MAX_RATE_LIMIT_RETRIES = 3
+_RATE_LIMIT_BACKOFF_SECONDS = 2.0  # doubled on each retry
+
+
+def _call_with_backoff(adapter: ArcAdapter, arm: str, messages: list[dict], **extra_kwargs) -> ChatCompletion:
+    last_error: RateLimitError | None = None
+    for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            return adapter.chat(arm, messages, **extra_kwargs)
+        except RateLimitError as e:
+            last_error = e
+            if attempt < _MAX_RATE_LIMIT_RETRIES:
+                time.sleep(_RATE_LIMIT_BACKOFF_SECONDS * (2**attempt))
+    raise last_error
+
 
 _REFUSAL_MARKERS = re.compile(
     r"i cannot assist|i can't assist"
@@ -116,7 +136,10 @@ def check_response(
 class AttemptDetail:
     model: str
     passed: bool
-    reward: float
+    # None when no reward was computed at all, an access-denied response
+    # says nothing about this arm's quality, so there's nothing honest to
+    # score it with
+    reward: float | None
     latency_ms: float
     propensity: float
     issues: list[QualityIssue]
@@ -140,6 +163,7 @@ def call_with_quality_gate(
     messages: list[dict],
     schema: type[BaseModel] | None = None,
     max_attempts: int | None = None,
+    **extra_kwargs,
 ) -> QualityGateOutcome:
     """Calls ARC, runs the response through the quality gate, and retries
     with a different arm on failure, feeding a real (not hardcoded)
@@ -148,6 +172,11 @@ def call_with_quality_gate(
     attempt gets logged, not just the winning one, so a caller can later
     tell how often each model got caught by the gate, not only which
     model ended up serving the response.
+
+    extra_kwargs is forwarded straight through to the underlying API
+    call on every attempt, this is how RAG's `files` parameter and web
+    search's `tool_ids` parameter get attached without either of them
+    needing their own copy of the retry/logging loop below.
     """
     max_attempts = min(max_attempts or len(bandit.arms), len(bandit.arms))
 
@@ -165,13 +194,33 @@ def call_with_quality_gate(
 
         start = time.monotonic()
         try:
-            completion = adapter.chat(arm, messages)
+            completion = _call_with_backoff(adapter, arm, messages, **extra_kwargs)
+        except PermissionDeniedError as e:
+            # ARC restricts its API to VT's campus network, this blocks
+            # every model identically, so there's no arm-specific signal
+            # to learn from it and no other arm worth trying instead.
+            # stop here rather than burn through the rest of the arms
+            # against the same access restriction.
+            latency_ms = (time.monotonic() - start) * 1000
+            issue = QualityIssue("permission_denied", str(e))
+            attempts.append(
+                AttemptDetail(
+                    model=arm, passed=False, reward=None, latency_ms=latency_ms,
+                    propensity=propensity, issues=[issue],
+                )
+            )
+            return QualityGateOutcome(
+                response=None, model_used=arm, passed=False, attempts=attempts, issues=[issue]
+            )
         except APIError as e:
-            # a network blip, rate limit, or ARC-side outage on this one
-            # model isn't a reason to give up on the whole request, treat
-            # it exactly like a failed quality check: log it, penalize
-            # this arm for this context, and let the loop try the next
-            # one instead of crashing the CLI with a raw traceback.
+            # a network blip or ARC-side outage on this one model isn't a
+            # reason to give up on the whole request, treat it exactly
+            # like a failed quality check: log it, penalize this arm for
+            # this context, and let the loop try the next one instead of
+            # crashing the CLI with a raw traceback. a rate limit that's
+            # still failing after _call_with_backoff's retries lands here
+            # too, at that point it's outlasted a reasonable wait and the
+            # next arm gets a turn same as any other failure.
             latency_ms = (time.monotonic() - start) * 1000
             issue = QualityIssue("api_error", str(e))
             reward = compute_reward(latency_ms=latency_ms, model=arm, quality_score=0.0)

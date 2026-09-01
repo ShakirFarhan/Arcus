@@ -38,6 +38,14 @@ def _compute_cost_scores() -> dict[str, float]:
 
 COST_SCORES = _compute_cost_scores()
 
+# a neutral, middle-of-the-road cost score for a model with no published
+# rate in the table above. Right now that's the web-search
+# "legacy-tool-calling" model variants, those are an ARC-side serving
+# mode rather than a separately priced product, so there's no real rate
+# to look up, this keeps reward computation from crashing instead of
+# asserting a pricing figure nobody's confirmed.
+_UNKNOWN_MODEL_COST_SCORE = 0.5
+
 
 def normalize_latency(latency_ms: float, ceiling_ms: float = 20_000) -> float:
     # past the ceiling, slower is just uniformly bad, no reason to keep
@@ -87,5 +95,5 @@ def compute_reward(
     return (
         weights.quality * quality_score
         + weights.latency * normalize_latency(latency_ms)
-        + weights.cost * COST_SCORES[model]
+        + weights.cost * COST_SCORES.get(model, _UNKNOWN_MODEL_COST_SCORE)
     )

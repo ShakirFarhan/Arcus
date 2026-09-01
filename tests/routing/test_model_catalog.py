@@ -1,7 +1,7 @@
 import time
 
 from arcus.adapters.arc_adapter import ArcModel
-from arcus.routing.model_catalog import known_arms
+from arcus.routing.model_catalog import filter_to_live, known_arms
 
 
 class _FakeAdapter:
@@ -77,3 +77,40 @@ def test_known_arms_rechecks_once_the_cache_has_expired(monkeypatch, tmp_path):
     known_arms(adapter)
 
     assert len(calls) == 2
+
+
+def test_filter_to_live_drops_candidates_missing_from_the_catalog(monkeypatch, tmp_path):
+    monkeypatch.setattr("arcus.routing.model_catalog.user_cache_dir", lambda name: str(tmp_path))
+
+    adapter = _FakeAdapter(["gpt-oss-120b-thinking-high-legacy-tool-calling"])
+    candidates = [
+        "gpt-oss-120b-thinking-high-legacy-tool-calling",
+        "Kimi-K3-thinking-max-legacy-tool-calling",
+    ]
+
+    result = filter_to_live(adapter, candidates)
+
+    assert result == ["gpt-oss-120b-thinking-high-legacy-tool-calling"]
+
+
+def test_filter_to_live_falls_back_to_all_candidates_when_the_catalog_check_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr("arcus.routing.model_catalog.user_cache_dir", lambda name: str(tmp_path))
+
+    class _Broken:
+        def list_models(self):
+            raise ConnectionError("arc is unreachable")
+
+    candidates = ["a-legacy-model", "another-legacy-model"]
+    assert filter_to_live(_Broken(), candidates) == candidates
+
+
+def test_filter_to_live_shares_the_cache_with_known_arms(monkeypatch, tmp_path):
+    monkeypatch.setattr("arcus.routing.model_catalog.user_cache_dir", lambda name: str(tmp_path))
+
+    calls = []
+    adapter = _FakeAdapter(_all_configured() + ["a-legacy-model"], calls=calls)
+
+    known_arms(adapter)
+    filter_to_live(adapter, ["a-legacy-model"])
+
+    assert len(calls) == 1

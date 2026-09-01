@@ -1,6 +1,6 @@
 import httpx
 import pytest
-from openai import APIConnectionError
+from openai import APIConnectionError, PermissionDeniedError, RateLimitError
 from pydantic import BaseModel
 
 from arcus.adapters.arc_adapter import ArcAdapter
@@ -13,12 +13,25 @@ from arcus.quality.gate import (
     check_schema,
     check_truncation,
     call_with_quality_gate,
+    _call_with_backoff,
 )
 
 
 def _connection_error(message: str) -> APIConnectionError:
     request = httpx.Request("POST", "https://llm-api.arc.vt.edu/api/v1/chat/completions")
     return APIConnectionError(message=message, request=request)
+
+
+def _rate_limit_error(message: str = "rate limited") -> RateLimitError:
+    request = httpx.Request("POST", "https://llm-api.arc.vt.edu/api/v1/chat/completions")
+    response = httpx.Response(429, request=request)
+    return RateLimitError(message=message, response=response, body=None)
+
+
+def _permission_denied_error(message: str = "VPN required") -> PermissionDeniedError:
+    request = httpx.Request("POST", "https://llm-api.arc.vt.edu/api/v1/chat/completions")
+    response = httpx.Response(403, request=request)
+    return PermissionDeniedError(message=message, response=response, body=None)
 
 LOOPING_TEXT = "the cat sat on the mat and " * 20
 NORMAL_TEXT = (
@@ -149,6 +162,26 @@ def test_first_arm_passes_returns_immediately():
     assert outcome.attempts[0].model == outcome.model_used
 
 
+def test_extra_kwargs_reach_the_underlying_api_call():
+    adapter = _make_adapter()
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _mock_completion(NORMAL_TEXT, "stop")
+
+    adapter._client.chat.completions.create = fake_create
+
+    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS[:1], epsilon=0.0), arms=ARMS[:1])
+
+    call_with_quality_gate(
+        adapter, bandit, "code:short", [{"role": "user", "content": "hi"}],
+        extra_body={"files": [{"type": "file", "id": "abc123"}]},
+    )
+
+    assert captured["extra_body"] == {"files": [{"type": "file", "id": "abc123"}]}
+
+
 def test_first_arm_fails_second_arm_passes():
     adapter = _make_adapter()
 
@@ -228,3 +261,121 @@ def test_every_arm_api_errors_returns_no_response_instead_of_crashing():
     assert len(outcome.attempts) == 3
     assert all(attempt.issues[0].kind == "api_error" for attempt in outcome.attempts)
     assert outcome.issues[0].kind == "api_error"
+
+
+def test_call_with_backoff_returns_immediately_on_success(monkeypatch):
+    adapter = _make_adapter()
+    adapter._client.chat.completions.create = lambda **kwargs: _mock_completion(NORMAL_TEXT, "stop")
+
+    slept = []
+    monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: slept.append(seconds))
+
+    result = _call_with_backoff(adapter, "gpt-oss-120b", [{"role": "user", "content": "hi"}])
+
+    assert result.choices[0].message.content == NORMAL_TEXT
+    assert slept == []
+
+
+def test_call_with_backoff_forwards_extra_kwargs(monkeypatch):
+    adapter = _make_adapter()
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _mock_completion(NORMAL_TEXT, "stop")
+
+    adapter._client.chat.completions.create = fake_create
+
+    _call_with_backoff(
+        adapter, "gpt-oss-120b", [{"role": "user", "content": "hi"}],
+        extra_body={"tool_ids": ["server:websearch"]},
+    )
+
+    assert captured["extra_body"] == {"tool_ids": ["server:websearch"]}
+
+
+def test_call_with_backoff_retries_the_same_arm_and_recovers(monkeypatch):
+    adapter = _make_adapter()
+    calls = []
+
+    def fake_create(model, **kwargs):
+        calls.append(model)
+        if len(calls) == 1:
+            raise _rate_limit_error()
+        return _mock_completion(NORMAL_TEXT, "stop")
+
+    adapter._client.chat.completions.create = fake_create
+
+    slept = []
+    monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: slept.append(seconds))
+
+    result = _call_with_backoff(adapter, "gpt-oss-120b", [{"role": "user", "content": "hi"}])
+
+    assert result.choices[0].message.content == NORMAL_TEXT
+    assert calls == ["gpt-oss-120b", "gpt-oss-120b"]
+    assert slept == [2.0]
+
+
+def test_call_with_backoff_raises_after_exhausting_retries(monkeypatch):
+    adapter = _make_adapter()
+    adapter._client.chat.completions.create = lambda **kwargs: (_ for _ in ()).throw(_rate_limit_error())
+
+    slept = []
+    monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: slept.append(seconds))
+
+    with pytest.raises(RateLimitError):
+        _call_with_backoff(adapter, "gpt-oss-120b", [{"role": "user", "content": "hi"}])
+
+    # 3 retries after the first attempt, backoff doubling each time
+    assert slept == [2.0, 4.0, 8.0]
+
+
+def test_a_rate_limit_that_outlasts_every_retry_falls_through_like_any_other_api_error(monkeypatch):
+    adapter = _make_adapter()
+    adapter._client.chat.completions.create = lambda **kwargs: (_ for _ in ()).throw(_rate_limit_error())
+    monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: None)
+
+    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS[:1], epsilon=0.0), arms=ARMS[:1])
+
+    outcome = call_with_quality_gate(
+        adapter, bandit, "code:short", [{"role": "user", "content": "hi"}], max_attempts=1
+    )
+
+    assert not outcome.passed
+    assert outcome.response is None
+    assert outcome.attempts[0].issues[0].kind == "api_error"
+
+
+def test_permission_denied_stops_immediately_without_trying_other_arms():
+    adapter = _make_adapter()
+    calls = []
+
+    def fake_create(model, **kwargs):
+        calls.append(model)
+        raise _permission_denied_error()
+
+    adapter._client.chat.completions.create = fake_create
+
+    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
+
+    outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
+
+    assert not outcome.passed
+    assert outcome.response is None
+    assert len(calls) == 1
+    assert len(outcome.attempts) == 1
+    assert outcome.attempts[0].issues[0].kind == "permission_denied"
+    assert outcome.issues[0].kind == "permission_denied"
+
+
+def test_permission_denied_does_not_penalize_the_bandit():
+    adapter = _make_adapter()
+    adapter._client.chat.completions.create = lambda **kwargs: (_ for _ in ()).throw(_permission_denied_error())
+
+    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
+    underlying = bandit._get_bandit("code:short")
+
+    outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
+
+    assert outcome.attempts[0].reward is None
+    assert all(pulls == 0 for pulls in underlying._pulls.values())

@@ -1,6 +1,7 @@
 import os
 from enum import Enum
 
+import httpx
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 
@@ -78,3 +79,33 @@ class ArcAdapter:
         catalog endpoint rather than anything hardcoded on our side.
         """
         return [entry.id for entry in self._client.models.list()]
+
+    def upload_file(self, path: str) -> str:
+        """Uploads a file to ARC's RAG endpoint and returns its file id,
+        for referencing in a later chat request's `files` parameter.
+
+        Not available through the openai SDK's own files API, ARC's
+        upload endpoint is its own multipart POST rather than an
+        OpenAI-compatible one, so this goes over httpx directly.
+        """
+        with open(path, "rb") as f:
+            response = httpx.post(
+                f"{self.BASE_URL}/files/",
+                headers={"Authorization": f"Bearer {self._client.api_key}", "Accept": "application/json"},
+                files={"file": f},
+                timeout=60.0,
+            )
+        response.raise_for_status()
+        return response.json()["id"]
+
+    def delete_file(self, file_id: str) -> None:
+        """Removes a previously uploaded file from the user's ARC account.
+        Best-effort cleanup, callers that don't want a failure here to be
+        fatal should catch httpx.HTTPError around this themselves.
+        """
+        response = httpx.delete(
+            f"{self.BASE_URL}/files/{file_id}",
+            headers={"Authorization": f"Bearer {self._client.api_key}"},
+            timeout=30.0,
+        )
+        response.raise_for_status()

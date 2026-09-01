@@ -83,3 +83,13 @@ def test_good_outcome_on_cheap_model_beats_bad_outcome_on_expensive_model():
     good = compute_reward(latency_ms=200, model="DeepSeek-V4-Flash", quality_score=1.0)
     bad = compute_reward(latency_ms=19_000, model="Kimi-K3", quality_score=0.0)
     assert good - bad > 0.5
+
+
+def test_compute_reward_does_not_crash_for_a_model_with_no_published_rate():
+    # web search routes through ARC's "legacy-tool-calling" model
+    # variants, which aren't in MODEL_HOSTING_RATES, this shouldn't
+    # raise a KeyError just because that name isn't in the cost table.
+    reward = compute_reward(
+        latency_ms=500, model="gpt-oss-120b-thinking-high-legacy-tool-calling", quality_score=1.0
+    )
+    assert 0.0 <= reward <= 1.0

@@ -44,6 +44,26 @@ def _write_cache(model_ids: set[str]) -> None:
         pass
 
 
+def _live_model_ids(adapter: ArcAdapter) -> set[str] | None:
+    """The live catalog, from cache if it's fresh enough, otherwise a
+    real check against ARC. Returns None (rather than an empty set) when
+    the catalog couldn't be determined at all, so callers can tell "ARC
+    has nothing live" apart from "couldn't find out right now" and fall
+    back to trusting their own hardcoded list in the latter case.
+    """
+    live_ids = _read_cache()
+    if live_ids is not None:
+        return live_ids
+
+    try:
+        live_ids = set(adapter.list_models())
+    except Exception:
+        return None
+
+    _write_cache(live_ids)
+    return live_ids
+
+
 def known_arms(adapter: ArcAdapter) -> list[str]:
     """Cross-checks the models this build knows how to route to against
     what ARC is actually serving right now, and drops anything that's
@@ -58,15 +78,19 @@ def known_arms(adapter: ArcAdapter) -> list[str]:
     unrecognizable response) rather than leave the bandit with nothing
     to route to over what's likely a transient problem.
     """
-    configured = [m.value for m in ArcModel]
+    return filter_to_live(adapter, [m.value for m in ArcModel])
 
-    live_ids = _read_cache()
+
+def filter_to_live(adapter: ArcAdapter, candidates: list[str]) -> list[str]:
+    """Same live cross-check as known_arms, generalized to any candidate
+    list, not just the core ArcModel arms. Used for the special-purpose
+    model variants (web search's legacy-tool-calling models, for
+    instance) that live outside the normal routing table but are just
+    as capable of being renamed or retired out from under us.
+    """
+    live_ids = _live_model_ids(adapter)
     if live_ids is None:
-        try:
-            live_ids = set(adapter.list_models())
-        except Exception:
-            return configured
-        _write_cache(live_ids)
+        return candidates
 
-    known = [arm for arm in configured if arm in live_ids]
-    return known or configured
+    known = [candidate for candidate in candidates if candidate in live_ids]
+    return known or candidates
