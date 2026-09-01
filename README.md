@@ -200,6 +200,29 @@ All three real algorithms land well below the random baseline, which is
 the actual point: they're spending far less time on worse-than-best
 arms than picking blindly would.
 
+### Document Q&A and web search
+
+Both build directly on capabilities ARC's own API already provides,
+rather than reimplementing them:
+
+- **`arcus --doc <path> "question"`** uploads the file to ARC's RAG
+  endpoint, attaches it to the request, and deletes it from your ARC
+  account again once you have an answer. Works across all four core
+  models, confirmed live against the real API.
+- **`arcus --web "question"`** routes to ARC's `server:websearch` tool
+  through three of its "legacy-tool-calling" model variants
+  (`gpt-oss-120b`, `Kimi-K3`, and the older `glm-52` variant) confirmed
+  to actually perform a real search and cite sources. A fourth,
+  DeepSeek's legacy variant, accepts the same request without erroring
+  but doesn't reliably act on it, live testing caught it answering a
+  time-sensitive question wrong with no citation, so it's left out.
+
+Both skip the semantic cache: a cached answer keyed on question text
+alone would risk answering about the wrong document, or serving a
+web-search answer that's since gone stale. See `src/arcus/cli.py`
+(`run_doc_ask`, `run_web_ask`) and `ArcAdapter.upload_file`/
+`delete_file` in `src/arcus/adapters/arc_adapter.py`.
+
 ## Install
 
 ```bash
@@ -228,8 +251,8 @@ ARC restricts the API to VT's campus network, so this (and every
 VPN. Arcus surfaces this as a clear message rather than the generic
 "no usable response" error when it happens.
 
-For tab completion on the `chat`/`stats`/`--random` words, add one of
-these to your shell config:
+For tab completion on the `chat`/`stats`/`models`/`config`/`--random`/
+`--image`/`--doc`/`--web` words, add one of these to your shell config:
 
 ```bash
 # zsh, in ~/.zshrc
@@ -270,6 +293,12 @@ arcus chat --save transcript.md
 # as vision-capable)
 arcus --image screenshot.png "what's wrong with this code?"
 
+# ask a question about a document, ARC handles the retrieval
+arcus --doc syllabus.pdf "when is the midterm?"
+
+# ask something that needs current information
+arcus --web "what's the latest release of Python?"
+
 # view or change local settings
 arcus config
 arcus config set bandit_algorithm ucb1
@@ -289,11 +318,18 @@ the trimmed context window) to a markdown file when you exit.
 
 `arcus --image <path> "question"` attaches an image to a one-shot
 question. It always goes to Kimi-K3 rather than through the usual
-bandit comparison, since that's the only one of the four models ARC's
-own docs describe as vision-capable, the others aren't confirmed either
-way. Skips the semantic cache entirely too, matching on the question
-text alone would risk serving back an answer about a completely
-different image. Not available in `arcus chat` yet, one-shot only.
+bandit comparison, confirmed directly against the API to be the only
+one of the four models that can actually see an image, GLM-5.3 and
+DeepSeek-V4-Flash both reject image content outright and gpt-oss-120b
+accepts the request but reports it can't see anything. Skips the
+semantic cache entirely too, matching on the question text alone would
+risk serving back an answer about a completely different image. Not
+available in `arcus chat` yet, one-shot only.
+
+`arcus --doc <path> "question"` and `arcus --web "question"` work the
+same way as `--image`, one-shot only, cache skipped, see "Document Q&A
+and web search" above for what each actually does. Only one of
+`--image`, `--doc`, or `--web` can be used at a time.
 
 `arcus config` shows your current settings (the API key masked) and the
 path to the config file. `arcus config set bandit_algorithm <algo>`
@@ -310,17 +346,21 @@ quality gate has caught and retried. Entirely local, no network call.
 
 Everything described above is implemented and working: the ARC adapter,
 context classification, all three bandit algorithms with propensity
-tracking, the reward function, the quality gate, the semantic cache and
-its benchmark, the CLI (ask command, chat mode with transcript export,
-image input, a config command, first-run wizard, error piping, stats,
-models), and the offline evaluation + regret benchmarking layer.
+tracking, the reward function, the quality gate (including rate-limit
+backoff and VPN-restriction handling), the semantic cache and its
+benchmark, the CLI (ask command, chat mode with transcript export,
+image input, document Q&A, web search, a config command, first-run
+wizard, error piping, stats, models), and the offline evaluation +
+regret benchmarking layer.
 
 Verified live against a real ARC key: all four models respond correctly
-(`tests/adapters/test_arc_adapter_live.py`), and a full end-to-end
+(`tests/adapters/test_arc_adapter_live.py`), a full end-to-end
 `arcus "..."` run exercises the whole pipeline (context classification,
 cache miss, bandit routing, a real ARC call, the quality gate, logging,
-and caching the result) against real traffic. Test suite: 223 passing
-with a key set (219 plus 4 live-only tests), 4 skipped without one.
+and caching the result) against real traffic, and image input, document
+Q&A, and web search have each been run against real responses too, not
+just unit tested. Test suite: 238 passing with a key set (234 plus 4
+live-only tests), 4 skipped without one.
 
 Worth knowing: ARC's models are reasoning models under the hood, they
 write to a hidden `reasoning` field before `content`, so a small
@@ -336,19 +376,23 @@ What's still open:
   there's a real query history, `arcus/eval/offline.py`'s
   `evaluate_policies()` is what turns it into the comparison table
   described above.
-- Image input's request-building and error handling are unit tested,
-  but haven't been confirmed against a real vision response from ARC
-  yet.
-- Image input is one-shot only, `arcus chat` doesn't support attaching
-  one mid-conversation.
+- Image input, document Q&A, and web search are all one-shot only,
+  `arcus chat` doesn't support attaching an image, a document, or
+  enabling search mid-conversation.
 
 ## Security & privacy
 
 - Each install uses its own user's ARC key. Keys are never shared,
   bundled, or sent anywhere but ARC's own endpoint.
-- No data leaves your machine by default. Request logs, cache entries,
-  and stats are all local SQLite, nothing is aggregated or reported
-  anywhere.
+- No data leaves your machine except to ARC itself, with your own key.
+  Request logs, cache entries, and stats are all local SQLite, nothing
+  is aggregated or reported anywhere else.
+- `arcus --doc` uploads the whole file to your ARC account temporarily
+  (deleted again once you have an answer), and `arcus --web` sends your
+  question through ARC's own web search tool. Both stay within ARC,
+  same as every other request, but a document leaving your machine
+  entirely (even briefly, even to your own account) is worth knowing
+  about explicitly.
 - This tool hasn't been through ARC's security review for regulated
   data (FERPA records, health data, etc.) the way ARC's own web
   interface has. Don't route sensitive regulated data through it.
