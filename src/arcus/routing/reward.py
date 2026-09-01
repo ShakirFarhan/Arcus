@@ -54,18 +54,6 @@ def normalize_latency(latency_ms: float, ceiling_ms: float = 20_000) -> float:
     return max(0.0, min(1.0, 1 - latency_ms / ceiling_ms))
 
 
-def basic_quality_score(finish_reason: str | None, content: str | None) -> float:
-    """A minimal quality signal: finished cleanly (finish_reason == "stop")
-    and non-empty content. The real request pipeline uses the fuller
-    checks in quality/gate.py instead.
-    """
-    if finish_reason != "stop":
-        return 0.0
-    if not content or not content.strip():
-        return 0.0
-    return 1.0
-
-
 @dataclass(frozen=True)
 class RewardWeights:
     quality: float

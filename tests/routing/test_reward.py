@@ -3,7 +3,6 @@ import pytest
 from arcus.routing.reward import (
     COST_SCORES,
     RewardWeights,
-    basic_quality_score,
     compute_reward,
     normalize_latency,
 )
@@ -39,20 +38,6 @@ def test_normalize_latency(latency_ms, expected):
 def test_normalize_latency_stays_in_unit_range_for_mid_values():
     score = normalize_latency(10_000)
     assert 0.0 < score < 1.0
-
-
-@pytest.mark.parametrize(
-    "finish_reason, content, expected",
-    [
-        ("stop", "here's your answer", 1.0),
-        ("length", "here's your answer", 0.0),
-        ("stop", "", 0.0),
-        ("stop", "   ", 0.0),
-        ("stop", None, 0.0),
-    ],
-)
-def test_basic_quality_score(finish_reason, content, expected):
-    assert basic_quality_score(finish_reason, content) == expected
 
 
 def test_compute_reward_rejects_weights_that_dont_sum_to_one():

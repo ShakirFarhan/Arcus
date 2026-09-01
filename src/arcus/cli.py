@@ -19,7 +19,7 @@ from arcus.cache.semantic_cache import lookup as cache_lookup
 from arcus.cache.semantic_cache import store as cache_store
 from arcus.config import ArcusConfig, BanditAlgorithm, config_path, load_config, save_config
 from arcus.embeddings import get_embedding_model
-from arcus.quality.gate import call_with_quality_gate
+from arcus.quality.gate import QualityIssue, call_with_quality_gate
 from arcus.routing.bandit import (
     Bandit,
     ContextualBandit,
@@ -254,31 +254,35 @@ def _run_setup_wizard() -> ArcusConfig:
     return config
 
 
-def run_ask(prompt: str, random_mode: bool = False) -> None:
-    console = Console()
+def _setup():
+    """Shared bootstrap for every entry point that talks to ARC: load
+    config, open the db engine, build the adapter, and kick off the
+    embedding-model warm-up thread in the background so it's ready (or
+    at least warming) by the time the context classifier's fallback path
+    or the semantic cache actually needs it, instead of paying that cost
+    inline and in serial with everything else.
 
-    # the embedding model backs both the context classifier's fallback
-    # path and the semantic cache lookup below, and loading it costs a
-    # few seconds the first time any process touches it. kick that load
-    # off now, in the background, so it's warm (or at least warming) by
-    # the time either one actually calls embed(), instead of eating that
-    # cost inline and in serial with everything else.
-    #
-    # this has to start AFTER building the ArcAdapter, not before.
-    # constructing the openai client is the first time this process
-    # touches httpx internals, and openai does that lazily, on client
-    # construction, not on import. starting the embedding thread first
-    # let it race that first-time httpx touch against sentence-transformers'
-    # own (torch/huggingface_hub) import chain, which also reaches into
-    # httpx, and that produced a real, reliably reproducible crash:
-    # "partially initialized module 'httpx' ... circular import". building
-    # the adapter first means the main thread finishes touching httpx
-    # before any second thread gets a chance to.
+    The thread has to start AFTER the adapter is built, not before.
+    Constructing the openai client is the first time a process touches
+    httpx internals, and openai does that lazily, on client
+    construction, not on import. Starting the embedding thread first let
+    it race that first-time httpx touch against sentence-transformers'
+    own (torch/huggingface_hub) import chain, which also reaches into
+    httpx, and that produced a real, reliably reproducible crash:
+    "partially initialized module 'httpx' ... circular import". Building
+    the adapter first means the main thread finishes touching httpx
+    before any second thread gets a chance to.
+    """
     config = _ensure_config()
     engine = get_engine()
     adapter = ArcAdapter(api_key=config.arc_api_key)
-
     threading.Thread(target=get_embedding_model, daemon=True).start()
+    return config, engine, adapter
+
+
+def run_ask(prompt: str, random_mode: bool = False) -> None:
+    console = Console()
+    config, engine, adapter = _setup()
 
     context = classify(prompt)
     mode = "random" if random_mode else "bandit"
@@ -330,12 +334,7 @@ def _build_image_content(prompt: str, image_path: str) -> list[dict]:
 
 def run_image_ask(prompt: str, image_path: str) -> None:
     console = Console()
-
-    config = _ensure_config()
-    engine = get_engine()
-    adapter = ArcAdapter(api_key=config.arc_api_key)
-
-    threading.Thread(target=get_embedding_model, daemon=True).start()
+    _config, engine, adapter = _setup()
 
     try:
         image_content = _build_image_content(prompt, image_path)
@@ -356,7 +355,7 @@ def run_image_ask(prompt: str, image_path: str) -> None:
     bandit = ContextualBandit(lambda: EpsilonGreedyBandit([_VISION_MODEL], epsilon=0.0), arms=[_VISION_MODEL])
     replay_history(bandit, engine, mode="bandit")
 
-    content, model_used, passed, issues = _route_and_answer(
+    content, _, _, issues = _route_and_answer(
         adapter, bandit, context, prompt, [{"role": "user", "content": image_content}], "bandit", engine
     )
 
@@ -365,12 +364,7 @@ def run_image_ask(prompt: str, image_path: str) -> None:
 
 def run_doc_ask(prompt: str, doc_path: str, random_mode: bool = False) -> None:
     console = Console()
-
-    config = _ensure_config()
-    engine = get_engine()
-    adapter = ArcAdapter(api_key=config.arc_api_key)
-
-    threading.Thread(target=get_embedding_model, daemon=True).start()
+    config, engine, adapter = _setup()
 
     try:
         file_id = adapter.upload_file(doc_path)
@@ -393,7 +387,7 @@ def run_doc_ask(prompt: str, doc_path: str, random_mode: bool = False) -> None:
     bandit = ContextualBandit(lambda: algorithm_factory(arms), arms=arms)
     replay_history(bandit, engine, mode=mode)
 
-    content, model_used, passed, issues = _route_and_answer(
+    content, _, _, issues = _route_and_answer(
         adapter,
         bandit,
         context,
@@ -417,12 +411,7 @@ def run_doc_ask(prompt: str, doc_path: str, random_mode: bool = False) -> None:
 
 def run_web_ask(prompt: str, random_mode: bool = False) -> None:
     console = Console()
-
-    config = _ensure_config()
-    engine = get_engine()
-    adapter = ArcAdapter(api_key=config.arc_api_key)
-
-    threading.Thread(target=get_embedding_model, daemon=True).start()
+    config, engine, adapter = _setup()
 
     # a web-search answer reflects a moment in time the same way a
     # volatile query does elsewhere in the cache, caching it risks
@@ -435,7 +424,7 @@ def run_web_ask(prompt: str, random_mode: bool = False) -> None:
     bandit = ContextualBandit(lambda: algorithm_factory(arms), arms=arms)
     replay_history(bandit, engine, mode=mode)
 
-    content, model_used, passed, issues = _route_and_answer(
+    content, _, _, issues = _route_and_answer(
         adapter,
         bandit,
         context,
@@ -449,7 +438,7 @@ def run_web_ask(prompt: str, random_mode: bool = False) -> None:
     console.print(content if content else _failure_message(issues))
 
 
-def _failure_message(issues: list) -> str:
+def _failure_message(issues: list[QualityIssue]) -> str:
     if any(issue.kind == "permission_denied" for issue in issues):
         return "[red]ARC restricts API access to VT's campus network, connect to the VPN and try again.[/red]"
     return "[red]no usable response from any model.[/red]"
@@ -466,7 +455,7 @@ def _route_and_answer(
     conversation_id: str | None = None,
     turn_index: int | None = None,
     **extra_kwargs,
-) -> tuple[str | None, str, bool, list]:
+) -> tuple[str | None, str, bool, list[QualityIssue]]:
     """Runs one turn through the quality gate, logs every attempt, and
     returns (content, model_used, passed, issues). content can be
     non-None even when passed is False (the last attempt still produced
@@ -524,12 +513,7 @@ def _write_transcript(path: str, turns: list[str]) -> None:
 
 def run_chat(random_mode: bool = False, save_path: str | None = None) -> None:
     console = Console()
-
-    config = _ensure_config()
-    engine = get_engine()
-    adapter = ArcAdapter(api_key=config.arc_api_key)  # before the thread, same reason as run_ask
-
-    threading.Thread(target=get_embedding_model, daemon=True).start()
+    config, engine, adapter = _setup()
 
     mode = "random" if random_mode else "bandit"
     arms = known_arms(adapter)
@@ -563,7 +547,7 @@ def run_chat(random_mode: bool = False, save_path: str | None = None) -> None:
         transcript.append(f"**You:** {user_input}\n")
         context = classify(user_input)
 
-        content, model_used, passed, issues = _route_and_answer(
+        content, model_used, _, issues = _route_and_answer(
             adapter,
             bandit,
             context,
