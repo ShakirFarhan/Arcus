@@ -521,24 +521,34 @@ def test_run_web_ask_attaches_the_websearch_tool_id_and_uses_legacy_arms(monkeyp
 
 def test_main_dispatches_to_doc_ask(monkeypatch):
     called = []
-    monkeypatch.setattr(cli, "run_doc_ask", lambda prompt, doc_path, random_mode: called.append((prompt, doc_path, random_mode)))
+    monkeypatch.setattr(
+        cli,
+        "run_doc_ask",
+        lambda prompt, doc_path, random_mode, model_override=None: called.append(
+            (prompt, doc_path, random_mode, model_override)
+        ),
+    )
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
     cli.main(["--doc", "paper.pdf", "summarize", "this"])
 
-    assert called == [("summarize this", "paper.pdf", False)]
+    assert called == [("summarize this", "paper.pdf", False, None)]
 
 
 def test_main_dispatches_to_web_ask(monkeypatch):
     called = []
-    monkeypatch.setattr(cli, "run_web_ask", lambda prompt, random_mode: called.append((prompt, random_mode)))
+    monkeypatch.setattr(
+        cli,
+        "run_web_ask",
+        lambda prompt, random_mode, model_override=None: called.append((prompt, random_mode, model_override)),
+    )
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
     cli.main(["--web", "what's", "new"])
 
-    assert called == [("what's new", False)]
+    assert called == [("what's new", False, None)]
 
 
 def test_main_rejects_combining_image_and_doc_flags(monkeypatch, capsys):
@@ -801,6 +811,19 @@ def test_trim_history_leaves_short_history_untouched():
     assert cli._trim_history(messages, max_messages=20) == messages
 
 
+def test_trim_history_handles_multimodal_content_the_same_as_text():
+    # an --image turn's content is a list of content parts, not a plain
+    # string, trimming shouldn't care, it only ever looks at position
+    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)} for i in range(23)]
+    messages[-1] = {"role": "user", "content": [{"type": "text", "text": "what's wrong here"}]}
+
+    trimmed = cli._trim_history(messages, max_messages=20)
+
+    assert len(trimmed) == 19
+    assert trimmed[0]["role"] == "user"
+    assert trimmed[-1]["content"] == [{"type": "text", "text": "what's wrong here"}]
+
+
 def test_run_models_lists_the_live_catalog_and_flags_routed_ones(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
     monkeypatch.setattr(
@@ -874,6 +897,28 @@ def test_run_config_set_rejects_an_invalid_algorithm(monkeypatch, capsys):
     assert "isn't a valid" in capsys.readouterr().out
 
 
+def test_run_config_set_enables_reasoning_variants(monkeypatch, capsys):
+    saved = {}
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(
+        cli, "save_config", lambda config: saved.update(enabled=config.enable_reasoning_variants)
+    )
+
+    cli.run_config(["set", "enable_reasoning_variants", "true"])
+
+    assert saved["enabled"] is True
+    assert "hasn't been confirmed against a live ARC key" in capsys.readouterr().out
+
+
+def test_run_config_set_rejects_a_non_boolean_reasoning_variants_value(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+
+    with pytest.raises(SystemExit):
+        cli.run_config(["set", "enable_reasoning_variants", "yes"])
+
+    assert "isn't valid" in capsys.readouterr().out
+
+
 def test_run_config_unrecognized_args_print_usage(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
 
@@ -921,6 +966,113 @@ def test_run_stats_handles_empty_log(monkeypatch, capsys):
     assert "no requests logged" in capsys.readouterr().out
 
 
+# --- run_eval ---------------------------------------------------------------
+
+
+def _log_eval_rows(engine, n, model="gpt-oss-120b", reward=0.8, propensity=0.5):
+    from arcus.storage.db import log_request
+
+    for i in range(n):
+        log_request(
+            prompt=f"question {i}",
+            task_type="code",
+            length_bucket="short",
+            model=model,
+            mode="bandit",
+            reward=reward,
+            propensity=propensity,
+            latency_ms=200,
+            engine=engine,
+        )
+
+
+def test_run_eval_reports_no_data_when_log_is_empty(monkeypatch, capsys):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+
+    cli.run_eval()
+
+    assert "no eligible logged requests" in capsys.readouterr().out
+
+
+def test_run_eval_flags_a_thin_sample_but_still_prints_the_table(monkeypatch, capsys):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    _log_eval_rows(engine, 3)
+
+    cli.run_eval()
+
+    output = capsys.readouterr().out
+    assert "illustrative" in output
+    assert "offline policy evaluation" in output
+    assert "greedy" in output
+
+
+def test_run_eval_warns_at_one_below_the_floor_but_not_at_the_floor(monkeypatch, capsys):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    _log_eval_rows(engine, cli._MIN_EVAL_EXAMPLES - 1)
+
+    cli.run_eval()
+
+    assert "illustrative" in capsys.readouterr().out
+
+
+def test_run_eval_still_works_when_arcs_catalog_is_unreachable(monkeypatch, capsys, tmp_path):
+    # arcus eval is fundamentally a local operation, reading your own
+    # logged history, it shouldn't be dead in the water just because
+    # you're off-VPN when you run it. undoes the autouse known_arms
+    # fake for this one test, this is specifically about proving the
+    # real model_catalog fallback (already unit tested on its own in
+    # tests/routing/test_model_catalog.py) actually gets exercised by
+    # run_eval, not just that a fake never gets called.
+    from arcus.routing.model_catalog import known_arms as real_known_arms
+
+    monkeypatch.setattr(cli, "known_arms", real_known_arms)
+    monkeypatch.setattr("arcus.routing.model_catalog.user_cache_dir", lambda name: str(tmp_path))
+
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+
+    class _Unreachable:
+        def list_models(self):
+            raise ConnectionError("offline, no VPN")
+
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: _Unreachable())
+    _log_eval_rows(engine, 5)
+
+    cli.run_eval()
+
+    output = capsys.readouterr().out
+    assert "offline policy evaluation" in output
+    flattened = "".join(output.split())
+    assert "alwaysgpt-oss-120b" in flattened
+
+
+def test_run_eval_omits_the_thin_sample_warning_above_the_floor(monkeypatch, capsys):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    _log_eval_rows(engine, cli._MIN_EVAL_EXAMPLES)
+
+    cli.run_eval()
+
+    output = capsys.readouterr().out
+    # a table cell can legitimately wrap onto its own line depending on
+    # console width, strip whitespace so the assertion doesn't depend on
+    # exactly where Rich decided to break a long policy name
+    flattened = "".join(output.split())
+    assert "illustrative" not in output
+    assert "alwaysgpt-oss-120b" in flattened
+    assert "alwaysGLM-5.3" in flattened
+
+
 def test_main_prints_version(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_version", lambda: "1.2.3")
     cli.main(["--version"])
@@ -966,6 +1118,13 @@ def test_main_dispatches_to_stats(monkeypatch):
     assert called == [True]
 
 
+def test_main_dispatches_to_eval(monkeypatch):
+    called = []
+    monkeypatch.setattr(cli, "run_eval", lambda: called.append(True))
+    cli.main(["eval"])
+    assert called == [True]
+
+
 def test_main_dispatches_to_chat(monkeypatch):
     called = []
     monkeypatch.setattr(
@@ -987,11 +1146,17 @@ def test_main_dispatches_to_chat_with_save_path(monkeypatch):
 def test_main_strips_random_flag_and_passes_it_through(monkeypatch):
     seen = {}
     monkeypatch.setattr(cli, "_build_prompt", lambda args: "explain recursion")
-    monkeypatch.setattr(cli, "run_ask", lambda prompt, random_mode: seen.update(prompt=prompt, random_mode=random_mode))
+    monkeypatch.setattr(
+        cli,
+        "run_ask",
+        lambda prompt, random_mode, model_override=None: seen.update(
+            prompt=prompt, random_mode=random_mode, model_override=model_override
+        ),
+    )
 
     cli.main(["--random", "explain", "recursion"])
 
-    assert seen == {"prompt": "explain recursion", "random_mode": True}
+    assert seen == {"prompt": "explain recursion", "random_mode": True, "model_override": None}
 
 
 def test_main_prints_usage_for_empty_input(monkeypatch, capsys):
@@ -1022,7 +1187,11 @@ def test_strip_flag_and_value_is_a_noop_when_absent():
 
 def test_main_strips_image_flag_and_dispatches_to_image_ask(monkeypatch):
     called = []
-    monkeypatch.setattr(cli, "run_image_ask", lambda prompt, image_path: called.append((prompt, image_path)))
+    monkeypatch.setattr(
+        cli,
+        "run_image_ask",
+        lambda prompt, image_path, model_override=None: called.append((prompt, image_path, model_override)),
+    )
     monkeypatch.setattr(
         cli, "run_ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("run_ask shouldn't fire here"))
     )
@@ -1031,4 +1200,603 @@ def test_main_strips_image_flag_and_dispatches_to_image_ask(monkeypatch):
 
     cli.main(["explain", "--image", "shot.png", "this", "error"])
 
-    assert called == [("explain this error", "shot.png")]
+    assert called == [("explain this error", "shot.png", None)]
+
+
+def test_main_strips_model_flag_and_dispatches_to_run_ask(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "run_ask",
+        lambda prompt, random_mode, model_override=None: seen.update(
+            prompt=prompt, random_mode=random_mode, model_override=model_override
+        ),
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["--model", "GLM-5.3", "explain", "recursion"])
+
+    assert seen == {"prompt": "explain recursion", "random_mode": False, "model_override": "GLM-5.3"}
+
+
+def test_main_rejects_model_combined_with_random_before_dispatching_anywhere(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "run_ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("shouldn't be called"))
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["--model", "GLM-5.3", "--random", "explain recursion"])
+
+    assert "contradict" in capsys.readouterr().out
+
+
+# --- _parse_request_flags / _validate_mode_flags -------------------------
+
+
+def test_parse_request_flags_pulls_out_every_flag_and_leaves_the_question():
+    flags = cli._parse_request_flags(
+        ["--model", "GLM-5.3", "--doc", "paper.pdf", "--random", "summarize", "this"]
+    )
+    assert flags.model_override == "GLM-5.3"
+    assert flags.doc_path == "paper.pdf"
+    assert flags.image_path is None
+    assert flags.web_mode is False
+    assert flags.random_mode is True
+    assert flags.remaining == ["summarize", "this"]
+
+
+def test_parse_request_flags_defaults_when_nothing_present():
+    flags = cli._parse_request_flags(["just", "a", "question"])
+    assert flags.model_override is None
+    assert flags.doc_path is None
+    assert flags.image_path is None
+    assert flags.web_mode is False
+    assert flags.random_mode is False
+    assert flags.remaining == ["just", "a", "question"]
+
+
+def test_validate_mode_flags_rejects_more_than_one_attachment_mode():
+    flags = cli._parse_request_flags(["--doc", "a.pdf", "--web", "question"])
+    error = cli._validate_mode_flags(flags)
+    assert error is not None
+    assert "only one of" in error
+
+
+def test_validate_mode_flags_rejects_model_combined_with_random():
+    flags = cli._parse_request_flags(["--model", "GLM-5.3", "--random", "question"])
+    error = cli._validate_mode_flags(flags)
+    assert error is not None
+    assert "contradict" in error
+
+
+def test_validate_mode_flags_allows_model_alone():
+    flags = cli._parse_request_flags(["--model", "GLM-5.3", "question"])
+    assert cli._validate_mode_flags(flags) is None
+
+
+# --- _resolve_model_override -----------------------------------------------
+
+
+def test_resolve_model_override_accepts_a_live_model():
+    assert cli._resolve_model_override(object(), "GLM-5.3") is None
+
+
+def test_resolve_model_override_rejects_a_model_arc_isnt_serving():
+    error = cli._resolve_model_override(object(), "gpt-5-nonexistent")
+    assert error is not None
+    assert "gpt-5-nonexistent" in error
+
+
+def test_resolve_model_override_for_web_mode_requires_a_legacy_tool_calling_arm():
+    valid = cli._WEB_SEARCH_MODELS[0]
+    assert cli._resolve_model_override(object(), valid, web_mode=True) is None
+
+    error = cli._resolve_model_override(object(), "GLM-5.3", web_mode=True)
+    assert error is not None
+    assert "doesn't do --web" in error
+
+
+def test_resolve_model_override_for_image_mode_requires_the_vision_model():
+    assert cli._resolve_model_override(object(), cli._VISION_MODEL, image_mode=True) is None
+
+    error = cli._resolve_model_override(object(), "GLM-5.3", image_mode=True)
+    assert error is not None
+    assert cli._VISION_MODEL in error
+
+
+# --- _arms_for_reasoning_context / _build_bandit ---------------------------
+
+
+_BASE_ARMS = ["gpt-oss-120b", "GLM-5.3", "Kimi-K3", "DeepSeek-V4-Flash"]
+
+
+def test_arms_for_reasoning_context_adds_variants_for_a_code_context():
+    result = cli._arms_for_reasoning_context(_BASE_ARMS, "code:short", object())
+    assert set(_BASE_ARMS).issubset(set(result))
+    assert set(cli._REASONING_VARIANTS).issubset(set(result))
+
+
+def test_arms_for_reasoning_context_leaves_non_reasoning_contexts_alone():
+    result = cli._arms_for_reasoning_context(_BASE_ARMS, "writing:short", object())
+    assert result == _BASE_ARMS
+
+
+def test_build_bandit_ignores_context_when_reasoning_variants_are_disabled():
+    bandit = cli._build_bandit(_BASE_ARMS, cli.EpsilonGreedyBandit, object(), enable_reasoning_variants=False)
+    assert bandit.arms_for("code:short") == _BASE_ARMS
+    assert bandit.arms_for("writing:short") == _BASE_ARMS
+
+
+def test_build_bandit_adds_variants_only_for_reasoning_contexts_when_enabled():
+    bandit = cli._build_bandit(_BASE_ARMS, cli.EpsilonGreedyBandit, object(), enable_reasoning_variants=True)
+
+    code_arms = bandit.arms_for("code:short")
+    assert set(_BASE_ARMS).issubset(set(code_arms))
+    assert len(code_arms) > len(_BASE_ARMS)
+    assert bandit.arms_for("writing:short") == _BASE_ARMS
+
+
+# --- run_ask(model_override=...) -------------------------------------------
+
+
+def test_run_ask_with_model_override_forces_a_single_arm_and_skips_the_cache(monkeypatch):
+    from arcus.quality.gate import AttemptDetail
+
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(cli, "replay_history", lambda bandit, engine, mode: None)
+    monkeypatch.setattr(
+        cli, "classify", lambda text: Context(task_type=TaskType.CODE, length_bucket=LengthBucket.SHORT)
+    )
+    monkeypatch.setattr(
+        cli, "cache_lookup", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("cache shouldn't be checked"))
+    )
+    monkeypatch.setattr(
+        cli, "cache_store", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("cache shouldn't be written"))
+    )
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        captured["arms"] = bandit.arms
+
+        class _Outcome:
+            response = _mock_completion("a specific answer")
+            model_used = "GLM-5.3"
+            passed = True
+            attempts = [
+                AttemptDetail(
+                    model="GLM-5.3", passed=True, reward=0.9, latency_ms=120.0, propensity=1.0, issues=[]
+                )
+            ]
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+
+    cli.run_ask("explain recursion", model_override="GLM-5.3")
+
+    assert captured["arms"] == ["GLM-5.3"]
+
+    with Session(engine) as session:
+        rows = session.exec(select(RequestLog)).all()
+    assert len(rows) == 1
+    assert rows[0].model == "GLM-5.3"
+    assert rows[0].mode == "manual"
+
+
+def test_run_ask_with_model_override_rejects_an_unknown_model(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "get_engine", lambda: _in_memory_engine())
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(
+        cli, "call_with_quality_gate", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("shouldn't be called"))
+    )
+
+    with pytest.raises(SystemExit):
+        cli.run_ask("explain recursion", model_override="not-a-real-model")
+
+    assert "not-a-real-model" in capsys.readouterr().out
+
+
+def test_run_ask_adds_reasoning_variants_for_a_code_prompt_when_enabled(monkeypatch):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k", enable_reasoning_variants=True)
+    )
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(cli, "replay_history", lambda bandit, engine, mode: None)
+    monkeypatch.setattr(
+        cli, "classify", lambda text: Context(task_type=TaskType.CODE, length_bucket=LengthBucket.SHORT)
+    )
+
+    class _Miss:
+        hit = False
+        response = None
+        model = None
+
+    monkeypatch.setattr(cli, "cache_lookup", lambda query, engine: _Miss())
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        captured["arms"] = bandit.arms_for(context_key)
+
+        class _Outcome:
+            response = _mock_completion("here's a function")
+            model_used = "gpt-oss-120b"
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+
+    cli.run_ask("write a function to reverse a linked list")
+
+    assert set(cli._REASONING_VARIANTS).issubset(set(captured["arms"]))
+
+
+def test_run_ask_leaves_a_writing_prompt_on_the_base_four_even_when_enabled(monkeypatch):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k", enable_reasoning_variants=True)
+    )
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(cli, "replay_history", lambda bandit, engine, mode: None)
+    monkeypatch.setattr(
+        cli, "classify", lambda text: Context(task_type=TaskType.WRITING, length_bucket=LengthBucket.SHORT)
+    )
+
+    class _Miss:
+        hit = False
+        response = None
+        model = None
+
+    monkeypatch.setattr(cli, "cache_lookup", lambda query, engine: _Miss())
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        captured["arms"] = bandit.arms_for(context_key)
+
+        class _Outcome:
+            response = _mock_completion("here's a draft")
+            model_used = "gpt-oss-120b"
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+
+    cli.run_ask("write me a short poem")
+
+    assert captured["arms"] == ["gpt-oss-120b", "GLM-5.3", "Kimi-K3", "DeepSeek-V4-Flash"]
+
+
+# --- run_chat inline --doc / --web / --image / --model ---------------------
+
+
+def test_run_chat_doc_flag_attaches_a_file_for_that_turn_only(monkeypatch):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+    fake_adapter = _FakeDocAdapter()
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: fake_adapter)
+
+    captured = []
+
+    def _fake_gate(adapter, bandit, context_key, messages, **kwargs):
+        captured.append(kwargs.get("extra_body"))
+
+        class _Outcome:
+            response = _mock_completion("the doc says X")
+            model_used = "gpt-oss-120b"
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr(
+        "builtins.input", _canned_input(["--doc paper.pdf summarize this", "a plain follow-up", "exit"])
+    )
+
+    cli.run_chat()
+
+    assert captured[0] == {"files": [{"type": "file", "id": "file-abc123"}]}
+    assert captured[1] is None
+    assert fake_adapter.deleted_ids == ["file-abc123"]
+
+
+def test_run_chat_doc_flag_cleans_up_the_file_even_when_the_answer_fails(monkeypatch):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+    fake_adapter = _FakeDocAdapter()
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: fake_adapter)
+
+    class _Outcome:
+        response = None
+        model_used = "gpt-oss-120b"
+        passed = False
+        attempts = []
+        issues = []
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", lambda *a, **kw: _Outcome())
+    monkeypatch.setattr(
+        "builtins.input", _canned_input(["--doc paper.pdf summarize this", "a follow-up", "exit"])
+    )
+
+    cli.run_chat()
+
+    # the failed turn's file still gets cleaned up, and the unanswered
+    # turn doesn't poison history for the next one
+    assert fake_adapter.deleted_ids == ["file-abc123"]
+
+
+def test_run_chat_recovers_from_an_unclosed_quote_and_keeps_going(monkeypatch):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    calls = []
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        calls.append(1)
+
+        class _Outcome:
+            response = _mock_completion("fine")
+            model_used = "gpt-oss-120b"
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr(
+        "builtins.input",
+        _canned_input(['--doc "unclosed.pdf summarize this', "a normal question", "exit"]),
+    )
+
+    cli.run_chat()  # should not raise
+
+    # the malformed line never reaches the gate, the next one still does
+    assert len(calls) == 1
+
+
+def test_run_chat_web_flag_routes_that_turn_through_legacy_search_arms(monkeypatch):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages, **kwargs):
+        captured["extra_body"] = kwargs.get("extra_body")
+        captured["arms"] = bandit.arms
+
+        class _Outcome:
+            response = _mock_completion("here's what's current")
+            model_used = cli._WEB_SEARCH_MODELS[0]
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr("builtins.input", _canned_input(["--web what's new in numpy", "exit"]))
+
+    cli.run_chat()
+
+    assert captured["extra_body"] == {"tool_ids": ["server:websearch"]}
+    assert set(captured["arms"]) == set(cli._WEB_SEARCH_MODELS)
+
+
+def test_run_chat_image_flag_forces_the_vision_model_for_that_turn(monkeypatch, tmp_path):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"fake png bytes")
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        captured["arms"] = bandit.arms
+        captured["content"] = messages[-1]["content"]
+
+        class _Outcome:
+            response = _mock_completion("that's a null pointer")
+            model_used = cli._VISION_MODEL
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr("builtins.input", _canned_input([f"--image {image_path} what's wrong", "exit"]))
+
+    cli.run_chat()
+
+    assert captured["arms"] == [cli._VISION_MODEL]
+    assert isinstance(captured["content"], list)
+    assert captured["content"][0]["text"] == "what's wrong"
+
+
+def test_run_chat_model_flag_forces_a_single_arm_for_that_turn(monkeypatch):
+    from arcus.quality.gate import AttemptDetail
+
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        captured["arms"] = bandit.arms
+
+        class _Outcome:
+            response = _mock_completion("a forced answer")
+            model_used = "Kimi-K3"
+            passed = True
+            attempts = [
+                AttemptDetail(
+                    model="Kimi-K3", passed=True, reward=0.9, latency_ms=90.0, propensity=1.0, issues=[]
+                )
+            ]
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr("builtins.input", _canned_input(["--model Kimi-K3 pick this one", "exit"]))
+
+    cli.run_chat()
+
+    assert captured["arms"] == ["Kimi-K3"]
+
+    with Session(engine) as session:
+        rows = session.exec(select(RequestLog)).all()
+    assert rows[0].mode == "manual"
+
+
+def test_run_chat_doc_flag_combined_with_model_override_uses_both(monkeypatch):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+    fake_adapter = _FakeDocAdapter()
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: fake_adapter)
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages, **kwargs):
+        captured["arms"] = bandit.arms
+        captured["extra_body"] = kwargs.get("extra_body")
+
+        class _Outcome:
+            response = _mock_completion("the doc, from GLM specifically")
+            model_used = "GLM-5.3"
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr(
+        "builtins.input",
+        _canned_input(["--doc paper.pdf --model GLM-5.3 summarize this", "exit"]),
+    )
+
+    cli.run_chat()
+
+    # both the forced arm and the file attachment have to survive
+    # together, neither flag should silently win over the other
+    assert captured["arms"] == ["GLM-5.3"]
+    assert captured["extra_body"] == {"files": [{"type": "file", "id": "file-abc123"}]}
+    assert fake_adapter.deleted_ids == ["file-abc123"]
+
+
+def test_run_chat_image_flag_with_a_matching_model_override_is_accepted(monkeypatch, tmp_path):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"fake png bytes")
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        captured["arms"] = bandit.arms
+
+        class _Outcome:
+            response = _mock_completion("that's a null pointer")
+            model_used = cli._VISION_MODEL
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr(
+        "builtins.input",
+        _canned_input([f"--image {image_path} --model {cli._VISION_MODEL} what's wrong", "exit"]),
+    )
+
+    cli.run_chat()
+
+    assert captured["arms"] == [cli._VISION_MODEL]
+
+
+def test_run_chat_image_flag_with_a_mismatched_model_override_is_rejected(monkeypatch, tmp_path):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"fake png bytes")
+
+    monkeypatch.setattr(
+        cli, "call_with_quality_gate", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("shouldn't be called"))
+    )
+    monkeypatch.setattr(
+        "builtins.input",
+        _canned_input([f"--image {image_path} --model GLM-5.3 what's wrong", "exit"]),
+    )
+
+    cli.run_chat()  # should not raise, just reject the turn and move on
+
+
+def test_run_chat_rejects_combining_attachment_flags_in_one_turn(monkeypatch, capsys):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    monkeypatch.setattr(
+        cli, "call_with_quality_gate", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("shouldn't be called"))
+    )
+    monkeypatch.setattr(
+        "builtins.input", _canned_input(["--doc a.pdf --web conflicting question", "exit"])
+    )
+
+    cli.run_chat()
+
+    assert "only one of" in capsys.readouterr().out
+
+
+def test_run_chat_rejects_an_unknown_model_override_and_keeps_going(monkeypatch):
+    engine = _in_memory_engine()
+    _chat_setup(monkeypatch, engine)
+
+    calls = []
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        calls.append(1)
+
+        class _Outcome:
+            response = _mock_completion("fine")
+            model_used = "gpt-oss-120b"
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+    monkeypatch.setattr(
+        "builtins.input",
+        _canned_input(["--model not-a-real-model bad override", "a fine question", "exit"]),
+    )
+
+    cli.run_chat()
+
+    # the bad turn never reaches the gate, the next turn still does
+    assert len(calls) == 1

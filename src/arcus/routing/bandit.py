@@ -6,6 +6,8 @@ import numpy as np
 
 
 class Bandit(Protocol):
+    arms: list[str]
+
     def select_arm(self, exclude: set[str] | None = None) -> str: ...
     def update(self, arm: str, reward: float) -> None: ...
     def propensity(self, arm: str, exclude: set[str] | None = None) -> float: ...
@@ -204,17 +206,35 @@ class ContextualBandit:
     contextual bandit approach, rather than one bandit shared across
     every kind of request. Instances are created lazily the first time a
     given context key shows up.
+
+    algorithm_factory takes the context_key being resolved. Most callers
+    build a bandit for one fixed arm list and just ignore the argument,
+    but some contexts (code, math, long-document, when reasoning-effort
+    variants are enabled) legitimately route across a bigger arm set
+    than others, and the factory needs to know which context it's
+    building for to decide that.
     """
 
-    def __init__(self, algorithm_factory: Callable[[], Bandit], arms: list[str]) -> None:
+    def __init__(self, algorithm_factory: Callable[[str], Bandit], arms: list[str]) -> None:
         self._algorithm_factory = algorithm_factory
         self.arms = list(arms)
         self._bandits: dict[str, Bandit] = {}
 
     def _get_bandit(self, context_key: str) -> Bandit:
         if context_key not in self._bandits:
-            self._bandits[context_key] = self._algorithm_factory()
+            self._bandits[context_key] = self._algorithm_factory(context_key)
         return self._bandits[context_key]
+
+    def arms_for(self, context_key: str) -> list[str]:
+        """The arm list actually in play for this specific context, not
+        just the nominal `arms` this instance was constructed with,
+        those two can differ once a context-dependent factory is in
+        use. Callers that need to know how many real fallback options
+        exist for the context they're routing right now (the quality
+        gate's retry budget, warm-start's stale-arm filter) should ask
+        here, not read `.arms` directly.
+        """
+        return self._get_bandit(context_key).arms
 
     def select_arm(self, context_key: str, exclude: set[str] | None = None) -> str:
         return self._get_bandit(context_key).select_arm(exclude=exclude)

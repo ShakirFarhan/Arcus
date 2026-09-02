@@ -15,6 +15,9 @@ machine with your own ARC key. Nothing goes through a shared server.
 arcus "explain how binary search works"
 ```
 
+**Contents:** [Why](#why) · [How it works](#how-it-works) · [Install](#install)
+· [Usage](#usage) · [Status](#status) · [Security & privacy](#security--privacy)
+
 ## Why
 
 ARC gives every VT user free access to four open-weight models
@@ -113,6 +116,17 @@ this doesn't cost a network round trip on every call) and quietly drops
 anything that's no longer live, rather than routing to a model
 guaranteed to fail. Local history logged under a since-renamed model id
 is skipped the same way when the bandit's state gets rebuilt.
+
+Optionally, code, math, and long-document questions can also route
+across ARC's `-thinking-*` reasoning-effort model variants, not just
+the base four (`arcus config set enable_reasoning_variants true`,
+default off). Everyday questions stay on the fast base four either way.
+**This is built and unit tested but hasn't been run against a real ARC
+key from this environment**, ARC's docs list these as separate catalog
+model ids rather than a parameter on the base id, the same pattern
+already confirmed for web search's legacy-tool-calling variants below,
+but that specific assumption is unverified. Ask a code or math question
+after turning it on and confirm it actually answers before trusting it.
 
 ### Quality gate
 
@@ -251,8 +265,9 @@ ARC restricts the API to VT's campus network, so this (and every
 VPN. Arcus surfaces this as a clear message rather than the generic
 "no usable response" error when it happens.
 
-For tab completion on the `chat`/`stats`/`models`/`config`/`--random`/
-`--image`/`--doc`/`--web` words, add one of these to your shell config:
+For tab completion on the `chat`/`stats`/`eval`/`models`/`config`/
+`--random`/`--model`/`--image`/`--doc`/`--web` words, add one of these
+to your shell config:
 
 ```bash
 # zsh, in ~/.zshrc
@@ -277,14 +292,23 @@ python broken.py 2>&1 | arcus "why is this failing"
 # force the random-routing baseline instead of the learned bandit policy
 arcus --random "explain how binary search works"
 
+# skip the bandit entirely and pin a specific model for this one call
+arcus --model GLM-5.3 "explain how binary search works"
+
 # see how it's doing
 arcus stats
+
+# compare the routing policy actually run against offline alternatives
+arcus eval
 
 # see every model ARC is currently serving, and which ones arcus routes to
 arcus models
 
 # hold a multi-turn conversation instead of a single question
 arcus chat
+
+# inside chat, --doc/--web/--image/--model all work inline, one
+# attachment per turn: "you: --doc paper.pdf summarize this"
 
 # save the conversation to a file when you leave
 arcus chat --save transcript.md
@@ -307,6 +331,23 @@ arcus config set bandit_algorithm ucb1
 arcus --version
 ```
 
+Quick reference, details for each are below:
+
+| Command | What it does |
+| --- | --- |
+| `arcus "<question>"` | Ask something, routed through the bandit + quality gate. |
+| `arcus --random "<question>"` | Same, but routes randomly instead of using the learned policy. |
+| `arcus --model NAME "<question>"` | Skip routing, pin one specific model. |
+| `arcus --image PATH "<question>"` | Ask about an image (vision-capable model only). |
+| `arcus --doc PATH "<question>"` | Ask about an uploaded document (RAG). |
+| `arcus --web "<question>"` | Ask something needing current information (web search). |
+| `arcus chat [--save PATH]` | Multi-turn conversation; `--doc`/`--web`/`--image`/`--model` all work inline per turn. |
+| `arcus stats` | Local routing performance so far. |
+| `arcus eval` | Offline comparison of the routing policy against alternatives. |
+| `arcus models` | ARC's live model catalog vs. what arcus routes to. |
+| `arcus config [set ...]` | View or change local settings. |
+| `arcus --version` | Installed version. |
+
 `arcus chat` opens a REPL that remembers everything said earlier in that
 session (resending the growing transcript each turn, since ARC's API has
 no session concept of its own) and routes each turn through the same
@@ -316,6 +357,12 @@ that one run, closing the terminal loses it, unless you pass `--save
 <path>`, which writes the full transcript (not just whatever's still in
 the trimmed context window) to a markdown file when you exit.
 
+`--doc PATH`, `--web`, `--image PATH`, and `--model NAME` all work
+inline inside `arcus chat` too, typed as part of a turn (`you: --doc
+paper.pdf summarize this`), one attachment per turn, the same rules as
+below apply. The attachment only applies to that one turn, a later turn
+that wants to keep asking about the same document attaches it again.
+
 `arcus --image <path> "question"` attaches an image to a one-shot
 question. It always goes to Kimi-K3 rather than through the usual
 bandit comparison, confirmed directly against the API to be the only
@@ -323,24 +370,41 @@ one of the four models that can actually see an image, GLM-5.3 and
 DeepSeek-V4-Flash both reject image content outright and gpt-oss-120b
 accepts the request but reports it can't see anything. Skips the
 semantic cache entirely too, matching on the question text alone would
-risk serving back an answer about a completely different image. Not
-available in `arcus chat` yet, one-shot only.
+risk serving back an answer about a completely different image.
 
 `arcus --doc <path> "question"` and `arcus --web "question"` work the
-same way as `--image`, one-shot only, cache skipped, see "Document Q&A
-and web search" above for what each actually does. Only one of
-`--image`, `--doc`, or `--web` can be used at a time.
+same way as `--image`, cache skipped, see "Document Q&A and web search"
+above for what each actually does. Only one of `--image`, `--doc`, or
+`--web` can be used at a time.
+
+`arcus --model NAME "question"` skips the bandit entirely and always
+uses that model, checked against ARC's live catalog first. Since
+there's only one arm, the quality gate's checks (empty, truncated,
+repetitive, refusal) still run and still get reported, there's just no
+other model left to fall back to if it fails, that's the point of an
+explicit override. Combine with `--web` or `--image` and the name has
+to be one of the models valid for that mode.
 
 `arcus config` shows your current settings (the API key masked) and the
 path to the config file. `arcus config set bandit_algorithm <algo>`
 changes which bandit algorithm arcus uses without hand-editing the TOML
-file. Re-keying isn't supported here on purpose, delete the config file
-and run `arcus` again to go through setup fresh.
+file. `arcus config set enable_reasoning_variants <true|false>` turns
+the reasoning-effort routing described above on or off. Re-keying isn't
+supported here on purpose, delete the config file and run `arcus` again
+to go through setup fresh.
 
 `arcus stats` reads your local SQLite log and prints a `rich`-formatted
 table: request count, average reward, average latency, and cost score
 per model per mode, plus your cache hit rate and how many attempts the
 quality gate has caught and retried. Entirely local, no network call.
+
+`arcus eval` runs the offline policy evaluation described above against
+your own logged history and prints the comparison table (IPS and
+doubly-robust estimates with 95% confidence intervals for the greedy
+policy and each "always use model X" baseline, against what actually
+ran). Below 30 logged bandit-mode requests it still prints the table but
+flags the numbers as illustrative only, a bootstrap confidence interval
+on a handful of rows isn't a reliable comparison yet.
 
 ## Status
 
@@ -348,9 +412,10 @@ Everything described above is implemented and working: the ARC adapter,
 context classification, all three bandit algorithms with propensity
 tracking, the reward function, the quality gate (including rate-limit
 backoff and VPN-restriction handling), the semantic cache and its
-benchmark, the CLI (ask command, chat mode with transcript export,
-image input, document Q&A, web search, a config command, first-run
-wizard, error piping, stats, models), and the offline evaluation +
+benchmark, the CLI (ask command with a manual `--model` override, chat
+mode with inline attachments and transcript export, image input,
+document Q&A, web search, a config command, first-run wizard, error
+piping, stats, models, and offline eval), and the offline evaluation +
 regret benchmarking layer.
 
 Verified live against a real ARC key: all four models respond correctly
@@ -359,8 +424,13 @@ Verified live against a real ARC key: all four models respond correctly
 cache miss, bandit routing, a real ARC call, the quality gate, logging,
 and caching the result) against real traffic, and image input, document
 Q&A, and web search have each been run against real responses too, not
-just unit tested. Test suite: 238 passing with a key set (234 plus 4
+just unit tested. Test suite: 273 passing with a key set (269 plus 4
 live-only tests), 4 skipped without one.
+
+The one exception: reasoning-effort variant routing
+(`enable_reasoning_variants`) is unit tested against a fake adapter only,
+not yet confirmed against a real ARC key, and defaults off for exactly
+that reason. See "Adaptive routing" above.
 
 Worth knowing: ARC's models are reasoning models under the hood, they
 write to a hidden `reasoning` field before `content`, so a small
@@ -372,13 +442,13 @@ budget of your own.
 
 What's still open:
 
-- Real logged usage is still thin (a handful of manual runs). Once
-  there's a real query history, `arcus/eval/offline.py`'s
-  `evaluate_policies()` is what turns it into the comparison table
-  described above.
-- Image input, document Q&A, and web search are all one-shot only,
-  `arcus chat` doesn't support attaching an image, a document, or
-  enabling search mid-conversation.
+- Real logged usage is still thin (a handful of manual runs). `arcus
+  eval` runs the comparison today, it's just not resting on enough
+  data yet to trust the numbers, it says so when that's the case rather
+  than presenting a false-confidence table.
+- Reasoning-effort variant routing needs a live-key run to confirm ARC
+  actually serves the `-thinking-*` ids the way its docs describe,
+  before it's safe to turn on by default.
 
 ## Security & privacy
 

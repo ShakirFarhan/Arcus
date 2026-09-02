@@ -13,7 +13,7 @@ def _in_memory_engine():
     return engine
 
 
-def _factory():
+def _factory(context_key):
     return EpsilonGreedyBandit(ARMS, epsilon=0.0)
 
 
@@ -93,6 +93,36 @@ def test_replay_history_skips_rows_for_a_retired_model():
     underlying = bandit._get_bandit("code:short")
     assert underlying._pulls == {"gpt-oss-120b": 1, "GLM-5.3": 0}
     assert underlying._reward_sums["gpt-oss-120b"] == 0.7
+
+
+def test_replay_history_checks_the_stale_arm_filter_per_context():
+    # an arm that's valid for one context but not another (a reasoning-
+    # effort variant only offered for code/math contexts, say) should
+    # replay into the context where it's valid and get skipped, not
+    # crash, in the context where it isn't
+    engine = _in_memory_engine()
+
+    log_request(
+        prompt="p1", task_type="code", length_bucket="short", model="only-valid-for-code",
+        mode="bandit", reward=0.9, engine=engine,
+    )
+    log_request(
+        prompt="p2", task_type="writing", length_bucket="long", model="only-valid-for-code",
+        mode="bandit", reward=0.1, engine=engine,
+    )
+
+    def factory(context_key):
+        arms = [*ARMS, "only-valid-for-code"] if context_key == "code:short" else ARMS
+        return EpsilonGreedyBandit(arms, epsilon=0.0)
+
+    bandit = ContextualBandit(factory, arms=ARMS)
+    replay_history(bandit, engine, mode="bandit")  # should not raise
+
+    code_bandit = bandit._get_bandit("code:short")
+    writing_bandit = bandit._get_bandit("writing:long")
+
+    assert code_bandit._pulls["only-valid-for-code"] == 1
+    assert "only-valid-for-code" not in writing_bandit._pulls
 
 
 def test_replay_history_keeps_contexts_separate():

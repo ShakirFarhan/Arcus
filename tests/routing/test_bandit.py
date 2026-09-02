@@ -87,7 +87,7 @@ def test_thompson_sampling_beta_update_favors_high_reward_arm():
 
 
 def test_contextual_bandit_keeps_independent_state_per_context():
-    def factory():
+    def factory(context_key):
         return EpsilonGreedyBandit(["a", "b"], epsilon=0.0)
 
     contextual = ContextualBandit(factory, arms=["a", "b"])
@@ -237,5 +237,16 @@ def test_thompson_sampling_propensity_favors_stronger_arm():
 
 
 def test_contextual_bandit_propensity_forwards_to_underlying_bandit():
-    contextual = ContextualBandit(lambda: EpsilonGreedyBandit(["a", "b"], epsilon=0.0), arms=["a", "b"])
+    contextual = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(["a", "b"], epsilon=0.0), arms=["a", "b"])
     assert contextual.propensity("code:short", "a") == 1.0
+
+
+def test_contextual_bandit_arms_for_returns_the_per_context_arm_list():
+    def factory(context_key):
+        arms = ["a", "b", "c"] if context_key == "code:short" else ["a", "b"]
+        return EpsilonGreedyBandit(arms, epsilon=0.0)
+
+    contextual = ContextualBandit(factory, arms=["a", "b"])
+
+    assert contextual.arms_for("code:short") == ["a", "b", "c"]
+    assert contextual.arms_for("writing:long") == ["a", "b"]

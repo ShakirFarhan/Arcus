@@ -16,6 +16,13 @@ class ArcusConfig(BaseSettings):
     # the algorithm is swappable here rather than hardcoded, so a user
     # can pick a different one without touching code.
     bandit_algorithm: BanditAlgorithm = "thompson"
+    # off by default: routing code/math/long-document questions across
+    # ARC's -thinking-* model variants too, not just the base four, is
+    # built and tested against a fake adapter, but hasn't been run
+    # against a real ARC key yet, see cli.py's _REASONING_VARIANTS.
+    # flip this on with `arcus config set enable_reasoning_variants true`
+    # once that's been confirmed live.
+    enable_reasoning_variants: bool = False
 
 
 def config_path() -> Path:
@@ -36,11 +43,13 @@ def save_config(config: ArcusConfig, path: Path | None = None) -> None:
     path = path or config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # only two fields right now, not worth pulling in a TOML-writing
-    # dependency just to serialize a couple of key/value lines.
+    # still just a handful of fields, not worth pulling in a TOML-writing
+    # dependency to serialize a few key/value lines. TOML booleans are
+    # bare lowercase true/false, not Python's True/False, hence the str.lower().
     path.write_text(
         f'arc_api_key = "{config.arc_api_key}"\n'
         f'bandit_algorithm = "{config.bandit_algorithm}"\n'
+        f"enable_reasoning_variants = {str(config.enable_reasoning_variants).lower()}\n"
     )
     # the API key lives on disk in plain text, chmod 600 so it's at least
     # not readable by other users on the same machine. skipped on

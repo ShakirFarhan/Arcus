@@ -178,7 +178,12 @@ def call_with_quality_gate(
     search's `tool_ids` parameter get attached without either of them
     needing their own copy of the retry/logging loop below.
     """
-    max_attempts = min(max_attempts or len(bandit.arms), len(bandit.arms))
+    # per-context, not bandit.arms globally: some contexts route across
+    # a bigger arm set than others (reasoning-effort variants on a
+    # code/math/long-document context, for instance), and the retry
+    # budget has to match what's actually selectable for this one.
+    context_arm_count = len(bandit.arms_for(context_key))
+    max_attempts = min(max_attempts or context_arm_count, context_arm_count)
 
     already_tried: set[str] = set()
     attempts: list[AttemptDetail] = []

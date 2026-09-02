@@ -32,6 +32,22 @@ def test_bandit_algorithm_roundtrips_a_non_default_choice(tmp_path):
     assert loaded.bandit_algorithm == "ucb1"
 
 
+def test_enable_reasoning_variants_defaults_to_false(tmp_path):
+    path = tmp_path / "config.toml"
+    save_config(ArcusConfig(arc_api_key="sk-test-123"), path=path)
+
+    loaded = load_config(path=path)
+    assert loaded.enable_reasoning_variants is False
+
+
+def test_enable_reasoning_variants_roundtrips_true(tmp_path):
+    path = tmp_path / "config.toml"
+    save_config(ArcusConfig(arc_api_key="sk-test-123", enable_reasoning_variants=True), path=path)
+
+    loaded = load_config(path=path)
+    assert loaded.enable_reasoning_variants is True
+
+
 def test_save_config_sets_restrictive_permissions(tmp_path):
     path = tmp_path / "config.toml"
     save_config(ArcusConfig(arc_api_key="sk-test-123"), path=path)

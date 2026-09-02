@@ -152,7 +152,7 @@ def test_first_arm_passes_returns_immediately():
     adapter = _make_adapter()
     adapter._client.chat.completions.create = lambda **kwargs: _mock_completion(NORMAL_TEXT, "stop")
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS[:2], epsilon=0.0), arms=ARMS[:2])
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS[:2], epsilon=0.0), arms=ARMS[:2])
 
     outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
 
@@ -172,7 +172,7 @@ def test_extra_kwargs_reach_the_underlying_api_call():
 
     adapter._client.chat.completions.create = fake_create
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS[:1], epsilon=0.0), arms=ARMS[:1])
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS[:1], epsilon=0.0), arms=ARMS[:1])
 
     call_with_quality_gate(
         adapter, bandit, "code:short", [{"role": "user", "content": "hi"}],
@@ -192,7 +192,7 @@ def test_first_arm_fails_second_arm_passes():
 
     adapter._client.chat.completions.create = fake_create
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS[:2], epsilon=0.0), arms=ARMS[:2])
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS[:2], epsilon=0.0), arms=ARMS[:2])
     # force "gpt-oss-120b" to be tried first, cold start would pick it
     # anyway since both start untried, but this keeps the test explicit
     bandit._get_bandit("code:short")._pulls["GLM-5.3"] = 0
@@ -211,7 +211,7 @@ def test_every_arm_fails_returns_last_attempt_without_looping_forever():
     adapter = _make_adapter()
     adapter._client.chat.completions.create = lambda **kwargs: _mock_completion(None, "length")
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
 
     outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
 
@@ -220,6 +220,27 @@ def test_every_arm_fails_returns_last_attempt_without_looping_forever():
     assert len({attempt.model for attempt in outcome.attempts}) == 3
     assert all(not attempt.passed for attempt in outcome.attempts)
     assert outcome.issues
+
+
+def test_max_attempts_respects_the_current_contexts_arm_count_not_a_global_one():
+    # a bandit whose arm set differs by context (reasoning-effort
+    # variants only on some task types, say), the retry budget for a
+    # given call has to come from that specific context's own arm list,
+    # not from whatever the bandit happened to be constructed with
+    adapter = _make_adapter()
+    adapter._client.chat.completions.create = lambda **kwargs: _mock_completion(None, "length")
+
+    def factory(context_key):
+        arms = ARMS if context_key == "code:short" else ARMS[:1]
+        return EpsilonGreedyBandit(arms, epsilon=0.0)
+
+    bandit = ContextualBandit(factory, arms=ARMS[:1])
+
+    code_outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
+    writing_outcome = call_with_quality_gate(adapter, bandit, "writing:short", [{"role": "user", "content": "hi"}])
+
+    assert len(code_outcome.attempts) == len(ARMS)
+    assert len(writing_outcome.attempts) == 1
 
 
 def test_api_error_on_one_arm_falls_back_to_next_arm():
@@ -232,7 +253,7 @@ def test_api_error_on_one_arm_falls_back_to_next_arm():
 
     adapter._client.chat.completions.create = fake_create
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS[:2], epsilon=0.0), arms=ARMS[:2])
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS[:2], epsilon=0.0), arms=ARMS[:2])
     bandit._get_bandit("code:short")._pulls["GLM-5.3"] = 0
 
     outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
@@ -252,7 +273,7 @@ def test_every_arm_api_errors_returns_no_response_instead_of_crashing():
         _connection_error("ARC is down")
     )
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
 
     outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
 
@@ -335,7 +356,7 @@ def test_a_rate_limit_that_outlasts_every_retry_falls_through_like_any_other_api
     adapter._client.chat.completions.create = lambda **kwargs: (_ for _ in ()).throw(_rate_limit_error())
     monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: None)
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS[:1], epsilon=0.0), arms=ARMS[:1])
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS[:1], epsilon=0.0), arms=ARMS[:1])
 
     outcome = call_with_quality_gate(
         adapter, bandit, "code:short", [{"role": "user", "content": "hi"}], max_attempts=1
@@ -356,7 +377,7 @@ def test_permission_denied_stops_immediately_without_trying_other_arms():
 
     adapter._client.chat.completions.create = fake_create
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
 
     outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
 
@@ -372,7 +393,7 @@ def test_permission_denied_does_not_penalize_the_bandit():
     adapter = _make_adapter()
     adapter._client.chat.completions.create = lambda **kwargs: (_ for _ in ()).throw(_permission_denied_error())
 
-    bandit = ContextualBandit(lambda: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
     underlying = bandit._get_bandit("code:short")
 
     outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
