@@ -117,16 +117,16 @@ anything that's no longer live, rather than routing to a model
 guaranteed to fail. Local history logged under a since-renamed model id
 is skipped the same way when the bandit's state gets rebuilt.
 
-Optionally, code, math, and long-document questions can also route
-across ARC's `-thinking-*` reasoning-effort model variants, not just
-the base four (`arcus config set enable_reasoning_variants true`,
-default off). Everyday questions stay on the fast base four either way.
-**This is built and unit tested but hasn't been run against a real ARC
-key from this environment**, ARC's docs list these as separate catalog
-model ids rather than a parameter on the base id, the same pattern
-already confirmed for web search's legacy-tool-calling variants below,
-but that specific assumption is unverified. Ask a code or math question
-after turning it on and confirm it actually answers before trusting it.
+Optionally, code, math, and long-document questions can route across
+ARC's `-thinking-*` reasoning-effort model variants too
+(`arcus config set enable_reasoning_variants true`, default off).
+Everyday questions stay on the fast base four either way. This is unit
+tested but hasn't run against a real ARC key from this environment.
+ARC's docs list these as separate catalog ids rather than a parameter
+on the base model, the same pattern already confirmed for web search's
+legacy-tool-calling variants below, but that's unverified here. Ask a
+code or math question after turning it on and confirm it actually
+answers before trusting it.
 
 ### Quality gate
 
@@ -408,47 +408,39 @@ on a handful of rows isn't a reliable comparison yet.
 
 ## Status
 
-Everything described above is implemented and working: the ARC adapter,
-context classification, all three bandit algorithms with propensity
-tracking, the reward function, the quality gate (including rate-limit
-backoff and VPN-restriction handling), the semantic cache and its
-benchmark, the CLI (ask command with a manual `--model` override, chat
-mode with inline attachments and transcript export, image input,
-document Q&A, web search, a config command, first-run wizard, error
-piping, stats, models, and offline eval), and the offline evaluation +
-regret benchmarking layer.
+Everything above is built and working, adapter, context classification,
+all three bandit algorithms, the reward function, the quality gate, the
+semantic cache, the offline eval / regret code. The CLI covers all of
+it: asking directly (with an optional `--model` override), chat with
+inline attachments and transcript export, image/doc/web modes, config,
+stats, and eval.
 
-Verified live against a real ARC key: all four models respond correctly
-(`tests/adapters/test_arc_adapter_live.py`), a full end-to-end
-`arcus "..."` run exercises the whole pipeline (context classification,
-cache miss, bandit routing, a real ARC call, the quality gate, logging,
-and caching the result) against real traffic, and image input, document
-Q&A, and web search have each been run against real responses too, not
-just unit tested. Test suite: 273 passing with a key set (269 plus 4
-live-only tests), 4 skipped without one.
+Live-tested against a real ARC key: all four models answer correctly
+(`tests/adapters/test_arc_adapter_live.py`), and a full `arcus "..."`
+run has gone through the real pipeline end to end, classification,
+cache miss, routing, an actual ARC call, the quality gate, logging,
+caching. Image input, document Q&A, and web search have each gotten a
+real run too. Test suite: 273 passing with a key set (269 + 4
+live-only), 4 skipped without one.
 
-The one exception: reasoning-effort variant routing
-(`enable_reasoning_variants`) is unit tested against a fake adapter only,
-not yet confirmed against a real ARC key, and defaults off for exactly
-that reason. See "Adaptive routing" above.
+Exception: reasoning-effort variant routing (`enable_reasoning_variants`)
+has only run against a fake adapter so far, which is why it defaults
+off. See "Adaptive routing" above.
 
-Worth knowing: ARC's models are reasoning models under the hood, they
-write to a hidden `reasoning` field before `content`, so a small
-`max_tokens` budget can get entirely spent on reasoning before any real
-answer comes out. The CLI itself never sets `max_tokens`, so normal
-usage isn't affected, ARC's server-side default leaves plenty of room,
-this only matters if you're calling the adapter directly with a tight
-budget of your own.
+ARC's models are reasoning models under the hood, they write to a
+hidden `reasoning` field before `content`, so a tight `max_tokens`
+budget can get eaten up before any real answer shows up. The CLI never
+sets `max_tokens` itself, so this doesn't affect normal usage, it only
+matters if you're calling the adapter directly with your own tight
+budget.
 
-What's still open:
+Still open:
 
-- Real logged usage is still thin (a handful of manual runs). `arcus
-  eval` runs the comparison today, it's just not resting on enough
-  data yet to trust the numbers, it says so when that's the case rather
-  than presenting a false-confidence table.
-- Reasoning-effort variant routing needs a live-key run to confirm ARC
-  actually serves the `-thinking-*` ids the way its docs describe,
-  before it's safe to turn on by default.
+- Real logged usage is thin (a handful of manual runs). `arcus eval`
+  runs today, it just doesn't have enough data yet, and says so
+  instead of faking confidence.
+- Reasoning-effort routing needs a live-key run before it's safe to
+  default on.
 
 ## Security & privacy
 
