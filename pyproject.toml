@@ -1,6 +1,6 @@
 [project]
 name = "arcus-cli"
-version = "0.2.0"
+version = "0.2.1"
 description = "Adaptive routing, a quality gate, and a correctness-aware cache on top of Virginia Tech ARC's LLM API"
 readme = "README.md"
 license = "MIT"
