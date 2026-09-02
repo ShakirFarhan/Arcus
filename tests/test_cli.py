@@ -82,6 +82,50 @@ def test_build_prompt_combines_piped_content_with_positional_args(monkeypatch):
     assert "why is this failing" in result
 
 
+def test_run_setup_wizard_exits_cleanly_when_the_prompt_is_aborted(monkeypatch, capsys):
+    import typer
+
+    def _abort(*a, **kw):
+        raise typer.Abort()
+
+    monkeypatch.setattr(cli.typer, "prompt", _abort)
+    monkeypatch.setattr(
+        cli, "ArcAdapter", lambda **kw: (_ for _ in ()).throw(AssertionError("shouldn't reach the key check"))
+    )
+    monkeypatch.setattr(
+        cli, "save_config", lambda config: (_ for _ in ()).throw(AssertionError("shouldn't save anything"))
+    )
+
+    with pytest.raises(SystemExit):
+        cli._run_setup_wizard()
+
+    # covers both an actual ctrl-c and a non-interactive run (piped
+    # input, a script, CI) with no terminal to prompt against at all
+    assert "interactive terminal" in capsys.readouterr().out
+
+
+def test_run_setup_wizard_saves_config_on_a_working_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.typer, "prompt", lambda *a, **kw: "sk-a-real-key")
+
+    class _StubAdapter:
+        def __init__(self, api_key):
+            self.api_key = api_key
+
+        def chat(self, model, messages, **kwargs):
+            return _mock_completion("ok")
+
+    monkeypatch.setattr(cli, "ArcAdapter", _StubAdapter)
+
+    saved = {}
+    monkeypatch.setattr(cli, "save_config", lambda config: saved.update(key=config.arc_api_key))
+    monkeypatch.setattr(cli, "config_path", lambda: tmp_path / "config.toml")
+
+    config = cli._run_setup_wizard()
+
+    assert config.arc_api_key == "sk-a-real-key"
+    assert saved["key"] == "sk-a-real-key"
+
+
 def test_run_ask_cache_hit_skips_bandit_and_logs_it(monkeypatch):
     engine = _in_memory_engine()
     monkeypatch.setattr(cli, "get_engine", lambda: engine)

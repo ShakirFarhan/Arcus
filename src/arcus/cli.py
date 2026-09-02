@@ -401,7 +401,19 @@ def _run_setup_wizard() -> ArcusConfig:
         f"full docs on the service: {_ARC_DOCS_URL}\n"
     )
 
-    api_key = typer.prompt("ARC API key", hide_input=True)
+    try:
+        api_key = typer.prompt("ARC API key", hide_input=True)
+    except typer.Abort as e:
+        # typer raises this both on an actual ctrl-c and on an EOF (no
+        # terminal to read from at all, piped input, a script, CI), the
+        # first run through anything non-interactive would otherwise hit
+        # a raw traceback instead of a clean explanation of what's missing
+        console.print(
+            "\n[red]no ARC key entered.[/red] arcus needs an interactive "
+            "terminal the first time it runs, to prompt for your key. "
+            "run `arcus` directly in a terminal once to finish setup."
+        )
+        raise SystemExit(1) from e
 
     console.print("checking that key works...")
     try:
