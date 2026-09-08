@@ -23,6 +23,8 @@ from arcus.config import ArcusConfig, BanditAlgorithm, config_path, load_config,
 from arcus.embeddings import get_embedding_model
 from arcus.eval.offline import evaluate_policies, greedy_policy_from_log, load_logged_examples, policy_always
 from arcus.quality.gate import QualityIssue, call_with_quality_gate
+from arcus.quality.judge import should_judge
+from arcus.quality.scoring import pending_rows, score_pending
 from arcus.routing.bandit import (
     Bandit,
     ContextualBandit,
@@ -73,7 +75,7 @@ _COMPLETION_SCRIPTS = {
 _arcus_completions() {
     local cur=${COMP_WORDS[COMP_CWORD]}
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "chat stats eval models config --random --model --version --image --doc --web" -- "$cur"))
+        COMPREPLY=($(compgen -W "chat stats eval judge models config --random --model --version --image --doc --web" -- "$cur"))
     fi
 }
 complete -F _arcus_completions arcus
@@ -82,7 +84,7 @@ complete -F _arcus_completions arcus
 #compdef arcus
 _arcus() {
     if [ "$CURRENT" -eq 2 ]; then
-        compadd chat stats eval models config --random --model --version --image --doc --web
+        compadd chat stats eval judge models config --random --model --version --image --doc --web
     fi
 }
 _arcus
@@ -96,7 +98,7 @@ def main(argv: list[str] | None = None) -> None:
     `arcus "some question"` to just work with no subcommand at all, and a
     real subcommand parser (click underneath typer) fights that: it wants
     to treat the prompt text itself as an unrecognized command. `stats`,
-    `chat`, `models`, `config`, and `eval` are the reserved words,
+    `chat`, `models`, `config`, `eval`, and `judge` are the reserved words,
     everything else is prompt text.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -124,6 +126,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if argv and argv[0] == "eval":
         run_eval()
+        return
+
+    if argv and argv[0] == "judge":
+        run_judge()
         return
 
     if argv and argv[0] == "chat":
@@ -357,8 +363,8 @@ def _build_prompt(args: list[str]) -> str:
 def _print_usage() -> None:
     Console().print(
         'usage: arcus "<question>" [--random | --model NAME] [--doc PATH | --web | --image PATH]\n'
-        "       arcus chat   or   arcus stats   or   arcus eval   or   "
-        "arcus models   or   arcus config"
+        "       arcus chat   or   arcus stats   or   arcus eval   or   arcus judge\n"
+        "       arcus models   or   arcus config"
     )
 
 
@@ -455,7 +461,32 @@ def _setup():
     engine = get_engine()
     adapter = ArcAdapter(api_key=config.arc_api_key)
     threading.Thread(target=get_embedding_model, daemon=True).start()
+    if config.enable_judge:
+        _start_background_scoring(adapter, engine)
     return config, engine, adapter
+
+
+def _start_background_scoring(adapter: ArcAdapter, engine) -> None:
+    """Grades a few of the responses still waiting on a judgement, in
+    the window where the user's own question is already in flight.
+
+    Daemon thread on purpose. If the process finishes first those rows
+    just stay pending and get picked up next run, so the worst case is a
+    judgement arriving a run later than it might have, never a lost or
+    half-written one. That's also why this never blocks or reports:
+    grading is bookkeeping about past answers, not part of answering the
+    question in front of the user.
+    """
+
+    def _drain():
+        try:
+            score_pending(adapter, engine)
+        except Exception:
+            # nothing here is worth interrupting someone's actual
+            # question over, the rows stay pending for next time
+            pass
+
+    threading.Thread(target=_drain, daemon=True).start()
 
 
 def run_ask(prompt: str, random_mode: bool = False, model_override: str | None = None) -> None:
@@ -699,7 +730,17 @@ def _route_and_answer(
     with console.status("[dim]thinking...[/dim]"):
         outcome = call_with_quality_gate(adapter, bandit, context.key, messages, **extra_kwargs)
 
+    # response is None when every arm errored out at the API level (see
+    # call_with_quality_gate), not just returned a bad answer
+    content = outcome.response.choices[0].message.content if outcome.response else None
+
+    # only the answer the user actually saw is worth grading. the
+    # attempts before it failed a structural check, which is already an
+    # honest zero, a judge has nothing to add to that.
+    judged_model = outcome.model_used if (outcome.passed and content and should_judge()) else None
+
     for attempt in outcome.attempts:
+        grade_this = judged_model is not None and attempt.model == judged_model and attempt.passed
         log_request(
             prompt=prompt,
             task_type=context.task_type.value,
@@ -712,12 +753,11 @@ def _route_and_answer(
             quality_passed=attempt.passed,
             conversation_id=conversation_id,
             turn_index=turn_index,
+            judge_pending=grade_this,
+            response_text=content if grade_this else None,
             engine=engine,
         )
 
-    # response is None when every arm errored out at the API level (see
-    # call_with_quality_gate), not just returned a bad answer
-    content = outcome.response.choices[0].message.content if outcome.response else None
     return content, outcome.model_used, outcome.passed, outcome.issues
 
 
@@ -1021,6 +1061,39 @@ def run_stats() -> None:
 # number but not a meaningful one, this is a plain rule-of-thumb floor,
 # not derived from anything, below it the table still prints but gets a
 # banner saying not to trust it yet
+def run_judge() -> None:
+    """Grades everything still waiting on a judgement, rather than the
+    few rows a normal run picks off in the background. Worth having as
+    its own command because the background drain is deliberately slow by
+    design, and anyone about to look at `arcus eval` wants the backlog
+    cleared first, not three rows at a time.
+    """
+    console = Console()
+    config = _ensure_config()
+    engine = get_engine()
+    adapter = ArcAdapter(api_key=config.arc_api_key)
+
+    waiting = len(pending_rows(engine, limit=_JUDGE_ALL))
+    if not waiting:
+        console.print("nothing waiting to be graded.")
+        return
+
+    console.print(f"grading {waiting} response(s)...")
+    with console.status("[dim]grading...[/dim]"):
+        scored = score_pending(adapter, engine, limit=_JUDGE_ALL)
+
+    console.print(f"[green]scored {scored} of {waiting}[/green]")
+    if scored < waiting:
+        # a judgement that came back unparseable or errored clears the
+        # queue anyway rather than retrying forever, so a gap here is
+        # expected and not worth alarming anyone about
+        console.print(f"[dim]{waiting - scored} couldn't be scored and were dropped from the queue[/dim]")
+
+
+# no real ceiling, `arcus judge` is an explicit "do the backlog now"
+# request, unlike the handful the background drain takes per run
+_JUDGE_ALL = 10_000
+
 _MIN_EVAL_EXAMPLES = 30
 
 

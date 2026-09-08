@@ -1,7 +1,7 @@
 from sqlmodel import Session, select
 
 from arcus.routing.bandit import ContextualBandit
-from arcus.storage.db import RequestLog
+from arcus.storage.db import REWARD_VERSION, RequestLog
 
 
 def replay_history(bandit: ContextualBandit, engine, mode: str) -> None:
@@ -21,6 +21,13 @@ def replay_history(bandit: ContextualBandit, engine, mode: str) -> None:
             select(RequestLog)
             .where(RequestLog.mode == mode)
             .where(RequestLog.reward.is_not(None))
+            # rewards from an older generation of the reward function
+            # aren't on the same scale as current ones, a pass/fail
+            # quality term scored every surviving response a flat 1.0
+            # where a graded one rarely does. replaying both together
+            # would hand the bandit an average of two different
+            # measurements, so only the current generation counts.
+            .where(RequestLog.reward_version == REWARD_VERSION)
             .order_by(RequestLog.created_at)
         ).all()
 

@@ -1,6 +1,6 @@
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, create_engine, select, text
 
-from arcus.storage.db import RequestLog, _database_url, get_engine, log_request
+from arcus.storage.db import REWARD_VERSION, RequestLog, _database_url, get_engine, log_request
 
 
 def _in_memory_engine():
@@ -138,3 +138,65 @@ def test_get_engine_creates_sqlite_file_on_disk(monkeypatch, tmp_path):
     get_engine()
 
     assert (tmp_path / "arcus.db").exists()
+
+
+def _legacy_schema_engine(path):
+    """A database shaped the way it was before grading existed: no
+    reward_version, judge, or response_text columns.
+    """
+    engine = create_engine(f"sqlite:///{path}")
+    with Session(engine) as session:
+        session.exec(
+            text(
+                "CREATE TABLE requestlog ("
+                "id INTEGER PRIMARY KEY, created_at DATETIME, prompt VARCHAR, "
+                "task_type VARCHAR, length_bucket VARCHAR, model VARCHAR, "
+                "propensity FLOAT, latency_ms FLOAT, finish_reason VARCHAR, "
+                "error VARCHAR, mode VARCHAR, reward FLOAT, cache_hit BOOLEAN, "
+                "quality_passed BOOLEAN, conversation_id VARCHAR, turn_index INTEGER)"
+            )
+        )
+        session.exec(
+            text(
+                "INSERT INTO requestlog (prompt, task_type, length_bucket, model, mode, reward) "
+                "VALUES ('old question', 'code', 'short', 'gpt-oss-120b', 'bandit', 1.0)"
+            )
+        )
+        session.commit()
+    return engine
+
+
+def test_migrate_adds_the_new_columns_to_an_older_database(monkeypatch, tmp_path):
+    db_path = tmp_path / "arcus.db"
+    _legacy_schema_engine(db_path)
+
+    monkeypatch.setenv("ARCUS_DATABASE_URL", f"sqlite:///{db_path}")
+    engine = get_engine()  # should not raise
+
+    with Session(engine) as session:
+        columns = {row[1] for row in session.exec(text("PRAGMA table_info(requestlog)")).all()}
+
+    assert {"reward_version", "judge_pending", "judge_score", "response_text"} <= columns
+
+
+def test_migrate_marks_pre_existing_rows_as_the_older_reward_generation(monkeypatch, tmp_path):
+    db_path = tmp_path / "arcus.db"
+    _legacy_schema_engine(db_path)
+
+    monkeypatch.setenv("ARCUS_DATABASE_URL", f"sqlite:///{db_path}")
+    engine = get_engine()
+
+    with Session(engine) as session:
+        row = session.exec(select(RequestLog)).one()
+
+    # a row written before grading existed was scored pass/fail, calling
+    # it current would quietly mix two different measurements
+    assert row.reward_version == 1
+
+
+def test_new_rows_carry_the_current_reward_generation():
+    engine = _in_memory_engine()
+    entry = log_request(
+        prompt="q", task_type="code", length_bucket="short", model="gpt-oss-120b", engine=engine
+    )
+    assert entry.reward_version == REWARD_VERSION

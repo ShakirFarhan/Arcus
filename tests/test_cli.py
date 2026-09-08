@@ -7,7 +7,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from arcus import cli
 from arcus.config import ArcusConfig
 from arcus.routing.context import Context, LengthBucket, TaskType
-from arcus.storage.db import RequestLog
+from arcus.storage.db import RequestLog, log_request
 
 
 def _in_memory_engine():
@@ -1844,3 +1844,178 @@ def test_run_chat_rejects_an_unknown_model_override_and_keeps_going(monkeypatch)
 
     # the bad turn never reaches the gate, the next turn still does
     assert len(calls) == 1
+
+
+# --- graded quality signal wiring ------------------------------------------
+
+
+def _judge_setup(monkeypatch, engine):
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(cli, "replay_history", lambda bandit, engine, mode: None)
+    monkeypatch.setattr(
+        cli, "classify", lambda text: Context(task_type=TaskType.CODE, length_bucket=LengthBucket.SHORT)
+    )
+
+    class _Miss:
+        hit = False
+        response = None
+        model = None
+
+    monkeypatch.setattr(cli, "cache_lookup", lambda query, engine: _Miss())
+    monkeypatch.setattr(cli, "cache_store", lambda *a, **kw: None)
+
+
+def _passing_outcome(model="gpt-oss-120b", content="an answer"):
+    from arcus.quality.gate import AttemptDetail
+
+    class _Outcome:
+        response = _mock_completion(content)
+        model_used = model
+        passed = True
+        attempts = [
+            AttemptDetail(model=model, passed=True, reward=0.9, latency_ms=200.0, propensity=1.0, issues=[])
+        ]
+        issues = []
+
+    return _Outcome()
+
+
+def test_a_sampled_answer_is_queued_for_grading_with_its_text(monkeypatch):
+    engine = _in_memory_engine()
+    _judge_setup(monkeypatch, engine)
+    monkeypatch.setattr(cli, "should_judge", lambda: True)
+    monkeypatch.setattr(cli, "call_with_quality_gate", lambda *a, **kw: _passing_outcome())
+
+    cli.run_ask("explain recursion")
+
+    with Session(engine) as session:
+        row = session.exec(select(RequestLog)).one()
+
+    assert row.judge_pending is True
+    # the judge needs the answer text later, so it rides along until then
+    assert row.response_text == "an answer"
+
+
+def test_an_unsampled_answer_is_not_queued(monkeypatch):
+    engine = _in_memory_engine()
+    _judge_setup(monkeypatch, engine)
+    monkeypatch.setattr(cli, "should_judge", lambda: False)
+    monkeypatch.setattr(cli, "call_with_quality_gate", lambda *a, **kw: _passing_outcome())
+
+    cli.run_ask("explain recursion")
+
+    with Session(engine) as session:
+        row = session.exec(select(RequestLog)).one()
+
+    assert row.judge_pending is False
+    assert row.response_text is None
+
+
+def test_only_the_answer_the_user_saw_gets_queued(monkeypatch):
+    from arcus.quality.gate import AttemptDetail
+
+    engine = _in_memory_engine()
+    _judge_setup(monkeypatch, engine)
+    monkeypatch.setattr(cli, "should_judge", lambda: True)
+
+    class _Outcome:
+        response = _mock_completion("the good answer")
+        model_used = "GLM-5.3"
+        passed = True
+        attempts = [
+            AttemptDetail(model="Kimi-K3", passed=False, reward=0.1, latency_ms=500.0, propensity=0.5, issues=[]),
+            AttemptDetail(model="GLM-5.3", passed=True, reward=0.9, latency_ms=200.0, propensity=0.5, issues=[]),
+        ]
+        issues = []
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", lambda *a, **kw: _Outcome())
+
+    cli.run_ask("explain recursion")
+
+    with Session(engine) as session:
+        rows = session.exec(select(RequestLog)).all()
+
+    queued = [r for r in rows if r.judge_pending]
+    # the failed attempt already earned an honest zero structurally,
+    # there's nothing for a judge to add to it
+    assert len(queued) == 1
+    assert queued[0].model == "GLM-5.3"
+
+
+def test_a_failed_request_is_never_queued_for_grading(monkeypatch):
+    engine = _in_memory_engine()
+    _judge_setup(monkeypatch, engine)
+    monkeypatch.setattr(cli, "should_judge", lambda: True)
+
+    class _Outcome:
+        response = None
+        model_used = "gpt-oss-120b"
+        passed = False
+        attempts = []
+        issues = []
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", lambda *a, **kw: _Outcome())
+
+    cli.run_ask("explain recursion")
+
+    with Session(engine) as session:
+        assert [r for r in session.exec(select(RequestLog)).all() if r.judge_pending] == []
+
+
+def test_main_dispatches_to_judge(monkeypatch):
+    called = []
+    monkeypatch.setattr(cli, "run_judge", lambda: called.append(True))
+    cli.main(["judge"])
+    assert called == [True]
+
+
+def test_run_judge_reports_when_nothing_is_waiting(monkeypatch, capsys):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+
+    cli.run_judge()
+
+    assert "nothing waiting" in capsys.readouterr().out
+
+
+def test_run_judge_grades_the_whole_backlog(monkeypatch, capsys):
+    from arcus.quality import scoring
+
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(scoring, "judge_response", lambda *a, **kw: 0.8)
+
+    # more than the background drain's per-run batch, to prove this one
+    # isn't bounded the same way
+    for i in range(6):
+        log_request(
+            prompt=f"q{i}", task_type="code", length_bucket="short", model="gpt-oss-120b",
+            mode="bandit", propensity=0.5, latency_ms=100.0, reward=0.9,
+            judge_pending=True, response_text="an answer", engine=engine,
+        )
+
+    cli.run_judge()
+
+    assert "scored 6 of 6" in capsys.readouterr().out
+
+
+def test_setup_skips_background_grading_when_the_judge_is_off(monkeypatch):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k", enable_judge=False)
+    )
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(
+        cli,
+        "_start_background_scoring",
+        lambda adapter, engine: (_ for _ in ()).throw(AssertionError("shouldn't start")),
+    )
+
+    cli._setup()

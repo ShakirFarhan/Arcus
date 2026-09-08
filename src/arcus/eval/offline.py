@@ -5,7 +5,7 @@ from typing import Callable
 
 from sqlmodel import Session, select
 
-from arcus.storage.db import RequestLog
+from arcus.storage.db import REWARD_VERSION, RequestLog
 
 Policy = Callable[[str], str]
 
@@ -23,6 +23,11 @@ def load_logged_examples(engine, mode: str = "bandit") -> list[LoggedExample]:
     offline evaluation: propensity has to be set (the whole point of
     logging it from day one) and reward has to be set (a row that errored
     out before a reward was computed can't tell an estimator anything).
+
+    Also restricted to the current reward generation. Estimating one
+    policy's value against a log whose rewards came from two different
+    quality measurements would produce a number with no meaning, however
+    tight the confidence interval around it looked.
     """
     with Session(engine) as session:
         rows = session.exec(
@@ -30,6 +35,7 @@ def load_logged_examples(engine, mode: str = "bandit") -> list[LoggedExample]:
             .where(RequestLog.mode == mode)
             .where(RequestLog.propensity.is_not(None))
             .where(RequestLog.reward.is_not(None))
+            .where(RequestLog.reward_version == REWARD_VERSION)
         ).all()
 
     return [

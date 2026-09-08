@@ -1,8 +1,8 @@
-from sqlmodel import SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from arcus.routing.bandit import ContextualBandit, EpsilonGreedyBandit
 from arcus.routing.warm_start import replay_history
-from arcus.storage.db import log_request
+from arcus.storage.db import RequestLog, log_request
 
 ARMS = ["gpt-oss-120b", "GLM-5.3"]
 
@@ -50,6 +50,30 @@ def test_replay_history_ignores_rows_with_no_reward():
         prompt="p1", task_type="code", length_bucket="short", model="gpt-oss-120b",
         mode="bandit", reward=None, engine=engine,
     )
+
+    bandit = ContextualBandit(_factory, arms=ARMS)
+    replay_history(bandit, engine, mode="bandit")
+
+    underlying = bandit._get_bandit("code:short")
+    assert underlying._pulls == {"gpt-oss-120b": 0, "GLM-5.3": 0}
+
+
+def test_replay_history_ignores_rows_from_an_older_reward_generation():
+    engine = _in_memory_engine()
+
+    log_request(
+        prompt="p1", task_type="code", length_bucket="short", model="gpt-oss-120b",
+        mode="bandit", reward=1.0, engine=engine,
+    )
+
+    # rewrite it as a pre-grading row, the way an upgraded database
+    # looks: quality was pass/fail then, so a surviving response scored
+    # a flat 1.0 where a graded one rarely would
+    with Session(engine) as session:
+        row = session.exec(select(RequestLog)).one()
+        row.reward_version = 1
+        session.add(row)
+        session.commit()
 
     bandit = ContextualBandit(_factory, arms=ARMS)
     replay_history(bandit, engine, mode="bandit")

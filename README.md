@@ -149,6 +149,45 @@ whole account, not one model, so hitting it stops the request
 immediately with a clear message instead of cycling through every arm
 against the same wall, and doesn't count against any model's reward.
 
+### Graded quality, not just pass/fail
+
+Those five checks are structural. They catch a response that came back
+broken, but a confidently wrong answer sails through all of them, and if
+that scores the same as a correct one then the router is really only
+learning which model returns intact-looking text fastest.
+
+So a sample of the answers that clear the gate (one in four by default)
+gets sent to a second model for a 0-10 grade on how well it actually
+answered the question, and that grade replaces the flat 1.0 in the
+reward. Two things make this practical:
+
+- **It never runs inline.** The answer is already on your screen. The
+  row is marked as awaiting a grade, and the next `arcus` run grades a
+  few in the background while your new question is in flight. If the
+  process exits first, they stay queued for next time. `arcus judge`
+  clears the whole backlog on demand.
+- **Nothing grades its own work.** gpt-oss-120b judges by default,
+  being the cheapest and fastest, except when it wrote the answer, in
+  which case GLM-5.3 does it instead. A model scoring itself is a known
+  source of self-preference bias and would undercut every number
+  downstream of it.
+
+A graded reward isn't comparable to a pass/fail one: the old scale gave
+every surviving response a perfect quality mark, so averaging the two
+together would hand the bandit the mean of two different measurements.
+Rows carry the reward generation that produced them, and anything that
+learns from the log (bandit warm start, `arcus eval`) reads only the
+current one. Upgrading is handled automatically, older rows are kept and
+still show up in `arcus stats`, they just stop feeding routing
+decisions. Turn the whole thing off with
+`arcus config set enable_judge false`.
+
+Honest limitation: the 75% that aren't sampled keep the provisional
+pass/fail score, so the signal is diluted by design, and LLM judges are
+known to compress toward the top of a scale. Both are reasons the
+per-model comparison in `arcus eval` should be read as directional until
+there's a lot more graded history behind it.
+
 ### Semantic cache
 
 Local `sentence-transformers` embeddings (`all-MiniLM-L6-v2`), cosine
@@ -265,9 +304,9 @@ ARC restricts the API to VT's campus network, so this (and every
 VPN. Arcus surfaces this as a clear message rather than the generic
 "no usable response" error when it happens.
 
-For tab completion on the `chat`/`stats`/`eval`/`models`/`config`/
-`--random`/`--model`/`--image`/`--doc`/`--web` words, add one of these
-to your shell config:
+For tab completion on the `chat`/`stats`/`eval`/`judge`/`models`/
+`config`/`--random`/`--model`/`--image`/`--doc`/`--web` words, add one
+of these to your shell config:
 
 ```bash
 # zsh, in ~/.zshrc
@@ -300,6 +339,9 @@ arcus stats
 
 # compare the routing policy actually run against offline alternatives
 arcus eval
+
+# grade every answer still waiting on a quality judgement
+arcus judge
 
 # see every model ARC is currently serving, and which ones arcus routes to
 arcus models
@@ -344,6 +386,7 @@ Quick reference, details for each are below:
 | `arcus chat [--save PATH]` | Multi-turn conversation; `--doc`/`--web`/`--image`/`--model` all work inline per turn. |
 | `arcus stats` | Local routing performance so far. |
 | `arcus eval` | Offline comparison of the routing policy against alternatives. |
+| `arcus judge` | Grade the backlog of answers still awaiting a quality score. |
 | `arcus models` | ARC's live model catalog vs. what arcus routes to. |
 | `arcus config [set ...]` | View or change local settings. |
 | `arcus --version` | Installed version. |
@@ -389,7 +432,9 @@ to be one of the models valid for that mode.
 path to the config file. `arcus config set bandit_algorithm <algo>`
 changes which bandit algorithm arcus uses without hand-editing the TOML
 file. `arcus config set enable_reasoning_variants <true|false>` turns
-the reasoning-effort routing described above on or off. Re-keying isn't
+the reasoning-effort routing described above on or off, and
+`arcus config set enable_judge <true|false>` turns response grading
+on or off. Re-keying isn't
 supported here on purpose, delete the config file and run `arcus` again
 to go through setup fresh.
 
@@ -406,6 +451,11 @@ ran). Below 30 logged bandit-mode requests it still prints the table but
 flags the numbers as illustrative only, a bootstrap confidence interval
 on a handful of rows isn't a reliable comparison yet.
 
+`arcus judge` grades everything still queued for a quality score in
+one go, rather than the few each normal run picks off in the
+background. Worth running before `arcus eval` so the comparison sees
+every grade that's been earned.
+
 ## Status
 
 Everything above is built and working, adapter, context classification,
@@ -420,7 +470,7 @@ Live-tested against a real ARC key: all four models answer correctly
 run has gone through the real pipeline end to end, classification,
 cache miss, routing, an actual ARC call, the quality gate, logging,
 caching. Image input, document Q&A, and web search have each gotten a
-real run too. Test suite: 273 passing with a key set (269 + 4
+real run too. Test suite: 317 passing with a key set (313 + 4
 live-only), 4 skipped without one.
 
 Exception: reasoning-effort variant routing (`enable_reasoning_variants`)

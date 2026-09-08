@@ -3,7 +3,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from platformdirs import user_data_dir
-from sqlmodel import Field, Session, SQLModel, create_engine
+from sqlmodel import Field, Session, SQLModel, create_engine, text
+
+# bump this whenever a change to reward.py's inputs makes new rewards
+# incomparable to old ones. 1: quality was pass/fail. 2: passing
+# responses carry a graded 0-1 judgement.
+REWARD_VERSION = 2
 
 
 class RequestLog(SQLModel, table=True):
@@ -52,6 +57,29 @@ class RequestLog(SQLModel, table=True):
     # alongside conversation_id for one-shot calls.
     turn_index: int | None = Field(default=None)
 
+    # which generation of the reward function produced `reward`. 1 is the
+    # original pass/fail quality term (anything clearing the gate scored
+    # a flat 1.0), 2 grades passing responses with a real 0-1 judgement.
+    # a v1 reward systematically overstates quality next to a v2 one, so
+    # anything that *learns* from this log (bandit warm start, offline
+    # policy evaluation) has to filter to one generation rather than
+    # averaging across both. descriptive views like `arcus stats` can
+    # still show everything.
+    reward_version: int = Field(default=REWARD_VERSION, index=True)
+
+    # this row was sampled for grading but hasn't been graded yet. the
+    # judge call deliberately doesn't run inline, see quality/judge.py.
+    judge_pending: bool = Field(default=False, index=True)
+    # the judge's 0-1 verdict, kept alongside `reward` rather than only
+    # folded into it, so a bad average can be traced back to whether the
+    # model answered badly or the judge scored oddly.
+    judge_score: float | None = Field(default=None)
+    # only held while a row is waiting to be judged, cleared once it has
+    # been. the judge needs the answer text and there's no reason to keep
+    # every response this tool has ever produced sitting on disk after
+    # that.
+    response_text: str | None = Field(default=None)
+
 
 def _database_url() -> str:
     override = os.environ.get("ARCUS_DATABASE_URL")
@@ -63,6 +91,36 @@ def _database_url() -> str:
     return f"sqlite:///{data_dir / 'arcus.db'}"
 
 
+# column name -> the DDL used to add it to a database that predates it.
+# the defaults here apply to rows that already exist, which is why
+# reward_version lands on 1 rather than the current REWARD_VERSION: rows
+# written before grading existed were scored pass/fail, and saying
+# otherwise would quietly mix two incomparable reward scales. new rows
+# get their value from the model field instead, not from this default.
+_ADDED_COLUMNS = {
+    "reward_version": "ALTER TABLE requestlog ADD COLUMN reward_version INTEGER DEFAULT 1",
+    "judge_pending": "ALTER TABLE requestlog ADD COLUMN judge_pending BOOLEAN DEFAULT 0",
+    "judge_score": "ALTER TABLE requestlog ADD COLUMN judge_score FLOAT",
+    "response_text": "ALTER TABLE requestlog ADD COLUMN response_text VARCHAR",
+}
+
+
+def _migrate(engine) -> None:
+    """Adds columns this build expects to a database written by an older
+    one. create_all() only ever creates missing tables, it won't touch
+    the shape of a table that already exists, so without this an
+    upgrading user hits an OperationalError on the first query that
+    mentions a new column.
+    """
+    with Session(engine) as session:
+        existing = {row[1] for row in session.exec(text("PRAGMA table_info(requestlog)")).all()}
+        missing = [ddl for column, ddl in _ADDED_COLUMNS.items() if column not in existing]
+        for ddl in missing:
+            session.exec(text(ddl))
+        if missing:
+            session.commit()
+
+
 def get_engine():
     # deliberately not cached as a module-level singleton. sqlite engine
     # creation is cheap, and skipping the singleton means there's no
@@ -70,6 +128,7 @@ def get_engine():
     # between one CLI run and the next, if ARCUS_DATABASE_URL changes).
     engine = create_engine(_database_url())
     SQLModel.metadata.create_all(engine)
+    _migrate(engine)
     return engine
 
 
@@ -88,11 +147,15 @@ def log_request(
     quality_passed: bool = True,
     conversation_id: str | None = None,
     turn_index: int | None = None,
+    judge_pending: bool = False,
+    response_text: str | None = None,
     engine=None,
 ) -> RequestLog:
     engine = engine or get_engine()
 
     entry = RequestLog(
+        judge_pending=judge_pending,
+        response_text=response_text,
         prompt=prompt,
         task_type=task_type,
         length_bucket=length_bucket,

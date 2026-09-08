@@ -23,6 +23,12 @@ class ArcusConfig(BaseSettings):
     # flip this on with `arcus config set enable_reasoning_variants true`
     # once that's been confirmed live.
     enable_reasoning_variants: bool = False
+    # grade a sample of answers with a second model, so the bandit learns
+    # from how good a response was rather than only whether it came back
+    # structurally intact. costs one extra ARC call per sampled answer,
+    # off the critical path, see quality/judge.py. turn it off to keep
+    # this tool's request volume as low as possible on shared infra.
+    enable_judge: bool = True
 
 
 def config_path() -> Path:
@@ -50,6 +56,7 @@ def save_config(config: ArcusConfig, path: Path | None = None) -> None:
         f'arc_api_key = "{config.arc_api_key}"\n'
         f'bandit_algorithm = "{config.bandit_algorithm}"\n'
         f"enable_reasoning_variants = {str(config.enable_reasoning_variants).lower()}\n"
+        f"enable_judge = {str(config.enable_judge).lower()}\n"
     )
     # the API key lives on disk in plain text, chmod 600 so it's at least
     # not readable by other users on the same machine. skipped on
