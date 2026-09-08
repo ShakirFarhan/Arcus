@@ -1,6 +1,6 @@
 import httpx
 import pytest
-from openai import APIConnectionError, PermissionDeniedError, RateLimitError
+from openai import APIConnectionError, BadRequestError, PermissionDeniedError, RateLimitError
 from pydantic import BaseModel
 
 from arcus.adapters.arc_adapter import ArcAdapter
@@ -400,3 +400,89 @@ def test_permission_denied_does_not_penalize_the_bandit():
 
     assert outcome.attempts[0].reward is None
     assert all(pulls == 0 for pulls in underlying._pulls.values())
+
+
+def _concurrency_limit_error() -> BadRequestError:
+    # the exact shape ARC returns when an account is holding 10 requests
+    # already, confirmed against the live API
+    request = httpx.Request("POST", "https://llm-api.arc.vt.edu/api/v1/chat/completions")
+    response = httpx.Response(400, request=request)
+    return BadRequestError(
+        message="Error code: 400 - {'detail': 'concurrent session limit reached'}",
+        response=response,
+        body=None,
+    )
+
+
+def test_is_concurrency_limit_recognizes_arcs_wording():
+    from arcus.quality.gate import is_concurrency_limit
+
+    assert is_concurrency_limit(_concurrency_limit_error())
+    assert not is_concurrency_limit(_connection_error("connection reset"))
+
+
+def test_concurrency_limit_retries_the_same_arm_instead_of_failing(monkeypatch):
+    adapter = _make_adapter()
+    calls = []
+
+    def fake_create(model, **kwargs):
+        calls.append(model)
+        if len(calls) == 1:
+            raise _concurrency_limit_error()
+        return _mock_completion(NORMAL_TEXT, "stop")
+
+    adapter._client.chat.completions.create = fake_create
+    monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: None)
+
+    result = _call_with_backoff(adapter, "gpt-oss-120b", [{"role": "user", "content": "hi"}])
+
+    # same arm twice, not a bail-out: the cap is about the account, not
+    # about gpt-oss-120b
+    assert calls == ["gpt-oss-120b", "gpt-oss-120b"]
+    assert result.choices[0].message.content == NORMAL_TEXT
+
+
+def test_a_genuinely_bad_request_is_not_retried(monkeypatch):
+    adapter = _make_adapter()
+    calls = []
+
+    def fake_create(model, **kwargs):
+        calls.append(model)
+        request = httpx.Request("POST", "https://llm-api.arc.vt.edu/api/v1/chat/completions")
+        raise BadRequestError(
+            message="Error code: 400 - {'detail': 'model not found'}",
+            response=httpx.Response(400, request=request),
+            body=None,
+        )
+
+    adapter._client.chat.completions.create = fake_create
+    monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: None)
+
+    with pytest.raises(BadRequestError):
+        _call_with_backoff(adapter, "gpt-oss-120b", [{"role": "user", "content": "hi"}])
+
+    # a permanent error shouldn't burn four attempts waiting for it to
+    # become true
+    assert calls == ["gpt-oss-120b"]
+
+
+def test_hitting_the_cap_never_charges_the_model(monkeypatch):
+    adapter = _make_adapter()
+    adapter._client.chat.completions.create = lambda **kwargs: (_ for _ in ()).throw(
+        _concurrency_limit_error()
+    )
+    monkeypatch.setattr("arcus.quality.gate.time.sleep", lambda seconds: None)
+
+    bandit = ContextualBandit(lambda _context_key: EpsilonGreedyBandit(ARMS, epsilon=0.0), arms=ARMS)
+    before = {arm: bandit._get_bandit("code:short")._pulls[arm] for arm in ARMS}
+
+    outcome = call_with_quality_gate(adapter, bandit, "code:short", [{"role": "user", "content": "hi"}])
+
+    after = {arm: bandit._get_bandit("code:short")._pulls[arm] for arm in ARMS}
+
+    assert not outcome.passed
+    assert all(a.issues[0].kind == "concurrency_limit" for a in outcome.attempts)
+    # no reward recorded and no bandit state moved: the account ran out
+    # of connection slots, which is not any model's fault
+    assert all(a.reward is None for a in outcome.attempts)
+    assert before == after

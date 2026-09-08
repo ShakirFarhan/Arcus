@@ -11,22 +11,41 @@ from arcus.routing.bandit import ContextualBandit
 from arcus.routing.reward import compute_reward
 
 # ARC enforces a per-account concurrent-request cap, not a per-model
-# one, so a 429 says nothing about whether the model that was just
-# called is any good. worth a few short retries against the same arm
-# before treating it like an actual failure of that model.
+# one, so being turned away says nothing about whether the model that
+# was just called is any good. worth a few short retries against the
+# same arm before treating it like an actual failure of that model.
 _MAX_RATE_LIMIT_RETRIES = 3
 _RATE_LIMIT_BACKOFF_SECONDS = 2.0  # doubled on each retry
 
+# ARC signals that cap with `400 {"detail": "concurrent session limit
+# reached"}`, not the 429 the SDK reserves for rate limiting, so
+# RateLimitError alone never catches it. Verified against the live API:
+# firing 12 requests at once returns exactly 10 completions and two of
+# these. Matching on the text is unpleasant but it's the only thing that
+# distinguishes "you're holding too many connections" from a genuinely
+# malformed request, and the difference matters: one deserves a retry
+# and costs the model nothing, the other is permanent.
+_CONCURRENCY_LIMIT_MARKER = "concurrent session limit"
+
+
+def is_concurrency_limit(error: BaseException) -> bool:
+    return _CONCURRENCY_LIMIT_MARKER in str(error).lower()
+
 
 def _call_with_backoff(adapter: ArcAdapter, arm: str, messages: list[dict], **extra_kwargs) -> ChatCompletion:
-    last_error: RateLimitError | None = None
+    last_error: BaseException | None = None
     for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
         try:
             return adapter.chat(arm, messages, **extra_kwargs)
         except RateLimitError as e:
             last_error = e
-            if attempt < _MAX_RATE_LIMIT_RETRIES:
-                time.sleep(_RATE_LIMIT_BACKOFF_SECONDS * (2**attempt))
+        except APIError as e:
+            if not is_concurrency_limit(e):
+                raise
+            last_error = e
+
+        if attempt < _MAX_RATE_LIMIT_RETRIES:
+            time.sleep(_RATE_LIMIT_BACKOFF_SECONDS * (2**attempt))
     raise last_error
 
 
@@ -222,14 +241,23 @@ def call_with_quality_gate(
             # reason to give up on the whole request, treat it exactly
             # like a failed quality check: log it, penalize this arm for
             # this context, and let the loop try the next one instead of
-            # crashing the CLI with a raw traceback. a rate limit that's
-            # still failing after _call_with_backoff's retries lands here
-            # too, at that point it's outlasted a reasonable wait and the
-            # next arm gets a turn same as any other failure.
+            # crashing the CLI with a raw traceback.
+            #
+            # the exception is the account-wide concurrency cap, which
+            # says nothing about this model and would be just as true of
+            # the next one. charging it to the arm would teach the bandit
+            # to distrust whichever models happened to be in flight when
+            # the account ran out of connection slots, which is exactly
+            # backwards, and it shows up constantly under any concurrent
+            # workload rather than being a rare edge case.
             latency_ms = (time.monotonic() - start) * 1000
-            issue = QualityIssue("api_error", str(e))
-            reward = compute_reward(latency_ms=latency_ms, model=arm, quality_score=0.0)
-            bandit.update(context_key, arm, reward)
+            hit_cap = is_concurrency_limit(e)
+            issue = QualityIssue("concurrency_limit" if hit_cap else "api_error", str(e))
+
+            reward = None
+            if not hit_cap:
+                reward = compute_reward(latency_ms=latency_ms, model=arm, quality_score=0.0)
+                bandit.update(context_key, arm, reward)
 
             attempts.append(
                 AttemptDetail(
