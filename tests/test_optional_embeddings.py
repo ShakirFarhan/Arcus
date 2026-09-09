@@ -83,6 +83,9 @@ def test_get_embedding_model_raises_a_actionable_error(monkeypatch):
 
 
 def test_embeddings_available_reflects_the_installed_state():
-    # sentence-transformers *is* installed in the dev environment, so
-    # this is the positive case; the fixture above covers the negative
-    assert embeddings.embeddings_available() is True
+    # has to agree with reality either way round, since this suite runs
+    # both with and without the extra installed
+    import importlib.util
+
+    really_installed = importlib.util.find_spec("sentence_transformers") is not None
+    assert embeddings.embeddings_available() is really_installed

@@ -47,6 +47,7 @@ def test_task_type_classification(text, expected):
         ("what's a good name for a pet hamster", TaskType.GENERAL),
     ],
 )
+@pytest.mark.requires_embeddings
 def test_embedding_fallback_classifies_keyword_free_prompts(text, expected):
     assert classify(text).task_type == expected
 

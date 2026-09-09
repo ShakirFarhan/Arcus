@@ -1,8 +1,10 @@
 import numpy as np
 
 from arcus.embeddings import embed
+import pytest
 
 
+@pytest.mark.requires_embeddings
 def test_embed_returns_normalized_vectors_of_expected_shape():
     vectors = embed(["hello world", "a completely different sentence"])
 

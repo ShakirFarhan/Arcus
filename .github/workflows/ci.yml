@@ -17,7 +17,10 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync
+        # --extra cache so the optional semantic-cache path is exercised
+        # here rather than only on machines that happen to have torch.
+        # The suite still passes without it, those tests just skip.
+        run: uv sync --extra cache
 
       - name: Run tests
         run: uv run pytest tests/ -q

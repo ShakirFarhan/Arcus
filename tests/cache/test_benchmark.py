@@ -1,10 +1,12 @@
 from arcus.cache.benchmark import BENCHMARK_PAIRS, run_benchmark
+import pytest
 
 
 def test_benchmark_set_has_a_meaningful_number_of_pairs():
     assert 50 <= len(BENCHMARK_PAIRS) <= 100
 
 
+@pytest.mark.requires_embeddings
 def test_param_diff_improves_precision_over_naive_cosine():
     results = run_benchmark()
     naive = results["naive_cosine"]

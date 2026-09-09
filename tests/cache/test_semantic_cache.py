@@ -71,6 +71,7 @@ def test_params_conflict_false_for_same_params():
     )
 
 
+@pytest.mark.requires_embeddings
 def test_store_and_lookup_hit_on_near_identical_stable_query():
     engine = _in_memory_engine()
     store(
@@ -101,6 +102,7 @@ def test_lookup_misses_on_unrelated_query():
     assert not result.hit
 
 
+@pytest.mark.requires_embeddings
 def test_lookup_misses_when_entry_expired_even_with_high_similarity():
     engine = _in_memory_engine()
     entry = store("how does binary search work", "some answer", model="gpt-oss-120b", engine=engine)
@@ -126,6 +128,7 @@ def test_lookup_misses_volatile_entry_immediately():
     assert not result.hit
 
 
+@pytest.mark.requires_embeddings
 def test_param_diff_rejects_high_similarity_conflicting_pair():
     engine = _in_memory_engine()
     store(
