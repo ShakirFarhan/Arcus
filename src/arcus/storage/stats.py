@@ -3,7 +3,6 @@ from statistics import mean
 
 from sqlmodel import Session, select
 
-from arcus.routing.reward import COST_SCORES
 from arcus.storage.db import RequestLog
 
 
@@ -14,7 +13,7 @@ class ArmModeSummary:
     request_count: int
     avg_reward: float | None
     avg_latency_ms: float | None
-    cost_score: float | None
+    judged_count: int
 
 
 def aggregate_by_arm_and_mode(engine) -> list[ArmModeSummary]:
@@ -44,7 +43,7 @@ def aggregate_by_arm_and_mode(engine) -> list[ArmModeSummary]:
                 request_count=len(entries),
                 avg_reward=mean(rewards) if rewards else None,
                 avg_latency_ms=mean(latencies) if latencies else None,
-                cost_score=COST_SCORES.get(model),
+                judged_count=sum(1 for e in entries if e.judge_score is not None),
             )
         )
 

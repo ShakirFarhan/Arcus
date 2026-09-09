@@ -37,14 +37,20 @@ name = "arcus-cli"
 version = "0.2.1"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
+    { name = "numpy" },
     { name = "openai" },
     { name = "platformdirs" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "rich" },
-    { name = "sentence-transformers" },
     { name = "sqlmodel" },
     { name = "typer" },
+]
+
+[package.optional-dependencies]
+cache = [
+    { name = "sentence-transformers" },
 ]
 
 [package.dev-dependencies]
@@ -54,15 +60,18 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "numpy", specifier = ">=2.0" },
     { name = "openai" },
     { name = "platformdirs", specifier = ">=4.11.3" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "rich", specifier = ">=15.0.0" },
-    { name = "sentence-transformers", specifier = ">=6.0.0" },
+    { name = "sentence-transformers", marker = "extra == 'cache'", specifier = ">=6.0.0" },
     { name = "sqlmodel", specifier = ">=0.0.39" },
     { name = "typer", specifier = ">=0.27.1" },
 ]
+provides-extras = ["cache"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest" }]

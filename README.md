@@ -5,11 +5,15 @@
 [![Python](https://img.shields.io/pypi/pyversions/arcus-cli.svg)](https://pypi.org/project/arcus-cli/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-A CLI that sits on top of Virginia Tech ARC's LLM API and makes it
-smarter: it picks which of ARC's four open-weight models to route a
-request to, checks the response before handing it back to you, and
-caches answers to questions it's already seen. Runs entirely on your own
-machine with your own ARC key. Nothing goes through a shared server.
+A CLI for Virginia Tech ARC's LLM API that checks the answer before
+handing it to you. It validates every response for truncation, empty
+output, repetition loops and refusals, retries on a different model when
+one comes back broken, and skips the call entirely for questions it has
+already answered. It also routes between ARC's four models adaptively,
+though that part is instrumented rather than proven, see Status.
+
+Runs entirely on your own machine with your own ARC key. Nothing goes
+through a shared server.
 
 ```bash
 arcus "explain how binary search works"
@@ -31,16 +35,21 @@ inside it was actually any good, a truncated answer or a flat refusal
 comes back looking the same as a correct one unless something reads the
 content. Arcus adds three things on top of the raw API:
 
-- **Adaptive routing** — a multi-armed bandit learns, per kind of
-  question, which model tends to give the best result for the least
-  latency and cost.
 - **A quality gate** — validates every response (truncation, empty
   output, repetition loops, refusal phrases, schema conformance) before
   it reaches you, and silently retries with a different model if the
-  first one produced garbage.
+  first one produced garbage. A sample of the answers that pass is then
+  graded by a second model, so the router learns from how good a
+  response was rather than only whether it arrived intact.
 - **A correctness-aware cache** — skips the API call entirely for
   questions it's answered before, but only when it's actually confident
-  the new question means the same thing as the cached one.
+  the new question means the same thing as the cached one. Measured:
+  precision 0.306 → 1.000 against a labeled benchmark.
+- **Adaptive routing** — a multi-armed bandit learns, per kind of
+  question, which model gives the best result for the least delay.
+  Built and fully instrumented, but not yet shown to beat simply
+  picking one model, and the README says so rather than implying
+  otherwise.
 
 ## How it works
 
@@ -94,12 +103,14 @@ Three interchangeable bandit algorithms, picked via config
 
 A random-selection baseline (`--random`) is also wired in as an A/B
 comparison point, mostly useful for the offline evaluation report below.
-The reward each arm is updated with is a weighted mix of quality (from
-the gate below), normalized latency, and a simulated cost signal built
-from real published hosting rates for these same open-weight models
-(ARC itself is free, this exists to demonstrate cost-aware routing as a
-practice). See `src/arcus/routing/bandit.py` and
-`src/arcus/routing/reward.py`.
+The reward each arm is updated with mixes graded quality (0.6) with
+normalized latency (0.4). Both are measured from the request that
+actually happened. An earlier version carried a third term, a cost score
+derived from other providers' published rates for these same open-weight
+models; it was removed because ARC is free, nobody is billed those
+rates, and a fifth of every routing decision was being driven by a
+number describing a hypothetical deployment rather than this one. See
+`src/arcus/routing/bandit.py` and `src/arcus/routing/reward.py`.
 
 Since every `arcus` invocation is a fresh process, there's no daemon
 holding the bandit's learned state in memory between runs. Instead,
@@ -190,6 +201,21 @@ there's a lot more graded history behind it.
 
 ### Semantic cache
 
+First, the obvious question: **ARC already caches, so why this?**
+Because they cache different things. ARC does prefix caching, reusing
+the computed attention state for a shared token prefix. Verified against
+the live API: sending an identical prompt three times reports 80 of 81
+prompt tokens served from cache and drops latency roughly 3x, but the
+completion token count differs every time (53, 48, 50), which means the
+*answer* is regenerated. ARC caches the computation; it never reuses the
+response, it still spends a request, and it still occupies one of your
+ten concurrent slots.
+
+Matching on meaning does something prefix caching structurally cannot.
+"when is project 2 due" and "when's project 2 due?" share almost no
+token prefix, so ARC's cache saves nothing, while this one returns
+instantly with no API call at all.
+
 Local `sentence-transformers` embeddings (`all-MiniLM-L6-v2`), cosine
 similarity lookup against everything stored so far. Two things keep it
 from just being a naive "similar enough, ship it" cache:
@@ -231,27 +257,22 @@ and doubly robust (DR) estimators plus percentile bootstrap confidence
 intervals, and `evaluate_policies()` produces a comparison table:
 the logged policy's actual average reward next to estimated values for
 any alternative policies you want to compare it against (e.g. "what if
-we'd always used the cheapest model").
+we'd always used gpt-oss-120b and never routed at all"). That last
+comparison is the one that decides whether the routing in this project
+is worth anything, which is why it's the first thing `arcus eval`
+prints once there's enough logged history to support it.
 
-Regret benchmarking is a different technique: it needs a *known*
-ground-truth reward per arm to measure regret against, which real
-traffic can't provide (a real request only ever explores one model per
-round, so there's no way to know what the other three would have
-scored). `src/arcus/eval/regret.py` simulates each algorithm against a
-labeled synthetic reward environment instead, this is the standard way
-to study a bandit algorithm's exploration behavior on its own, separate
-from real-world model quality. A sample run (2000 rounds, seed 42):
-
-| algorithm      | final cumulative regret |
-| -------------- | ------------------------ |
-| epsilon-greedy  | 7.9                       |
-| thompson        | 25.4                      |
-| ucb1            | 58.6                      |
-| random          | 76.9                      |
-
-All three real algorithms land well below the random baseline, which is
-the actual point: they're spending far less time on worse-than-best
-arms than picking blindly would.
+`src/arcus/eval/regret.py` is a separate thing and worth being clear
+about: it's a **simulation**, not a measurement. Regret needs a known
+ground-truth reward per arm, which real traffic can never supply, since
+a real request only ever tries one model and you never learn what the
+other three would have scored. So it runs each algorithm against a
+synthetic environment with invented reward distributions. That's the
+standard way to study a bandit's exploration behavior in isolation, and
+it says nothing whatsoever about ARC or about these four models. Its
+numbers are deliberately not reproduced here, because a results table
+sitting next to the measured one above would invite exactly the
+confusion this paragraph exists to prevent.
 
 ### Document Q&A and web search
 
@@ -282,6 +303,16 @@ web-search answer that's since gone stale. See `src/arcus/cli.py`
 pip install arcus-cli
 # or, with uv
 uv tool install arcus-cli
+```
+
+Semantic caching is an optional extra, because it needs
+`sentence-transformers`, which pulls in torch and takes the install from
+about 115MB to roughly 865MB. Without it the cache reports every
+question as a miss and the context classifier falls back to its regex
+rules; everything else is unchanged.
+
+```bash
+pip install 'arcus-cli[cache]'
 ```
 
 Or run from source:
@@ -439,9 +470,10 @@ supported here on purpose, delete the config file and run `arcus` again
 to go through setup fresh.
 
 `arcus stats` reads your local SQLite log and prints a `rich`-formatted
-table: request count, average reward, average latency, and cost score
-per model per mode, plus your cache hit rate and how many attempts the
-quality gate has caught and retried. Entirely local, no network call.
+table: request count, average reward, average latency, and how many
+responses carry a quality grade, per model per mode, plus your cache hit
+rate and how many attempts the quality gate has caught and retried.
+Entirely local, no network call.
 
 `arcus eval` runs the offline policy evaluation described above against
 your own logged history and prints the comparison table (IPS and
@@ -470,7 +502,7 @@ Live-tested against a real ARC key: all four models answer correctly
 run has gone through the real pipeline end to end, classification,
 cache miss, routing, an actual ARC call, the quality gate, logging,
 caching. Image input, document Q&A, and web search have each gotten a
-real run too. Test suite: 317 passing with a key set (313 + 4
+real run too. Test suite: 326 passing with a key set (322 + 4
 live-only), 4 skipped without one.
 
 Exception: reasoning-effort variant routing (`enable_reasoning_variants`)

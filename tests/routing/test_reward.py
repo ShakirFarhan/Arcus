@@ -1,26 +1,10 @@
 import pytest
 
 from arcus.routing.reward import (
-    COST_SCORES,
     RewardWeights,
     compute_reward,
     normalize_latency,
 )
-
-
-def test_cost_scores_are_all_in_unit_range():
-    for score in COST_SCORES.values():
-        assert 0.0 <= score <= 1.0
-
-
-def test_cost_scores_match_the_real_pricing_spread():
-    # gpt-oss-120b and DeepSeek-V4-Flash are both cheap speed-tier
-    # models, Kimi-K3 is priced as a premium agentic model, GLM-5.3
-    # sits in between.
-    assert COST_SCORES["gpt-oss-120b"] > COST_SCORES["GLM-5.3"]
-    assert COST_SCORES["DeepSeek-V4-Flash"] > COST_SCORES["GLM-5.3"]
-    assert COST_SCORES["GLM-5.3"] > COST_SCORES["Kimi-K3"]
-    assert COST_SCORES["Kimi-K3"] == 0.0
 
 
 @pytest.mark.parametrize(
@@ -41,7 +25,7 @@ def test_normalize_latency_stays_in_unit_range_for_mid_values():
 
 
 def test_compute_reward_rejects_weights_that_dont_sum_to_one():
-    bad_weights = RewardWeights(quality=0.5, latency=0.5, cost=0.5)
+    bad_weights = RewardWeights(quality=0.5, latency=0.9)
     with pytest.raises(ValueError):
         compute_reward(latency_ms=100, model="gpt-oss-120b", quality_score=1.0, weights=bad_weights)
 
@@ -58,23 +42,33 @@ def test_lower_latency_gives_higher_reward_all_else_equal():
     assert fast > slow
 
 
-def test_cheaper_model_gives_higher_reward_all_else_equal():
-    expensive = compute_reward(latency_ms=1000, model="Kimi-K3", quality_score=1.0)
-    cheap = compute_reward(latency_ms=1000, model="DeepSeek-V4-Flash", quality_score=1.0)
-    assert cheap > expensive
+def test_quality_outweighs_latency():
+    # a fast wrong answer is worth about nothing, so it has to score
+    # below a slow correct one
+    fast_and_wrong = compute_reward(latency_ms=0, model="GLM-5.3", quality_score=0.0)
+    slow_and_right = compute_reward(latency_ms=19_000, model="GLM-5.3", quality_score=1.0)
+    assert slow_and_right > fast_and_wrong
 
 
-def test_good_outcome_on_cheap_model_beats_bad_outcome_on_expensive_model():
-    good = compute_reward(latency_ms=200, model="DeepSeek-V4-Flash", quality_score=1.0)
-    bad = compute_reward(latency_ms=19_000, model="Kimi-K3", quality_score=0.0)
-    assert good - bad > 0.5
+def test_reward_no_longer_depends_on_which_model_answered():
+    # the cost term was the only thing that varied by model, and it was
+    # built from other providers' pricing for a service that's free.
+    # with it gone, two identical outcomes score identically no matter
+    # which arm produced them.
+    a = compute_reward(latency_ms=1000, model="Kimi-K3", quality_score=0.8)
+    b = compute_reward(latency_ms=1000, model="DeepSeek-V4-Flash", quality_score=0.8)
+    assert a == b
 
 
-def test_compute_reward_does_not_crash_for_a_model_with_no_published_rate():
-    # web search routes through ARC's "legacy-tool-calling" model
-    # variants, which aren't in MODEL_HOSTING_RATES, this shouldn't
-    # raise a KeyError just because that name isn't in the cost table.
+def test_reward_stays_in_unit_range_for_any_model_name():
+    # web search and reasoning variants route through model ids that no
+    # lookup table was ever going to contain
     reward = compute_reward(
         latency_ms=500, model="gpt-oss-120b-thinking-high-legacy-tool-calling", quality_score=1.0
     )
     assert 0.0 <= reward <= 1.0
+
+
+def test_perfect_outcome_scores_one_and_worst_scores_zero():
+    assert compute_reward(latency_ms=0, model="GLM-5.3", quality_score=1.0) == pytest.approx(1.0)
+    assert compute_reward(latency_ms=20_000, model="GLM-5.3", quality_score=0.0) == pytest.approx(0.0)

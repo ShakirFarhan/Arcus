@@ -6,7 +6,7 @@ from enum import Enum
 import numpy as np
 from sqlmodel import Field, Session, SQLModel, select
 
-from arcus.embeddings import embed
+from arcus.embeddings import embed, embeddings_available
 from arcus.storage.db import get_engine
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.80
@@ -101,7 +101,15 @@ def _is_expired(entry: CacheEntry) -> bool:
     return datetime.now(UTC) > expires_at
 
 
-def store(query: str, response: str, model: str, engine=None) -> CacheEntry:
+def store(query: str, response: str, model: str, engine=None) -> CacheEntry | None:
+    """Caches one answer, or does nothing and returns None when the
+    embedding model isn't installed. Storing without it is impossible
+    (there'd be no vector to match against later) and it isn't worth
+    failing a request the user already got an answer to.
+    """
+    if not embeddings_available():
+        return None
+
     engine = engine or get_engine()
 
     vector = embed([query])[0]
@@ -138,6 +146,12 @@ def lookup(
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     use_param_diff: bool = True,
 ) -> CacheResult:
+    if not embeddings_available():
+        # every question is a miss without a way to compare meanings.
+        # the caller pays one extra ARC call, which is the whole tradeoff
+        # of the lighter install.
+        return CacheResult(hit=False, response=None, similarity=None, matched_query=None, model=None)
+
     engine = engine or get_engine()
 
     with Session(engine) as session:

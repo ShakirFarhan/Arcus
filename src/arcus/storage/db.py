@@ -7,8 +7,9 @@ from sqlmodel import Field, Session, SQLModel, create_engine, text
 
 # bump this whenever a change to reward.py's inputs makes new rewards
 # incomparable to old ones. 1: quality was pass/fail. 2: passing
-# responses carry a graded 0-1 judgement.
-REWARD_VERSION = 2
+# responses carry a graded 0-1 judgement. 3: the simulated cost term was
+# dropped and quality/latency reweighted, so the scale moved again.
+REWARD_VERSION = 3
 
 
 class RequestLog(SQLModel, table=True):

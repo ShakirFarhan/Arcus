@@ -1,9 +1,28 @@
+import importlib.util
 import threading
 
 import numpy as np
 
 _model_cache = None
 _model_lock = threading.Lock()
+
+
+class EmbeddingsUnavailable(RuntimeError):
+    """sentence-transformers isn't installed.
+
+    It lives behind the `cache` extra rather than in the base install:
+    it pulls in torch and friends, which is most of a gigabyte, and the
+    two things it powers (the semantic cache, and the classifier's
+    fallback for prompts the regex rules miss) are both nice-to-have
+    rather than load-bearing. Everything that touches embeddings has to
+    degrade rather than crash when this is raised.
+    """
+
+
+def embeddings_available() -> bool:
+    if _model_cache is not None:
+        return True
+    return importlib.util.find_spec("sentence_transformers") is not None
 
 
 def get_embedding_model():
@@ -23,7 +42,13 @@ def get_embedding_model():
 
     with _model_lock:
         if _model_cache is None:
-            from sentence_transformers import SentenceTransformer
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError as e:
+                raise EmbeddingsUnavailable(
+                    "semantic caching needs sentence-transformers, "
+                    "install it with: pip install 'arcus-cli[cache]'"
+                ) from e
 
             _model_cache = SentenceTransformer("all-MiniLM-L6-v2")
     return _model_cache

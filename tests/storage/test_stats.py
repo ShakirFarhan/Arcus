@@ -1,6 +1,5 @@
 from sqlmodel import SQLModel, create_engine
 
-from arcus.routing.reward import COST_SCORES
 from arcus.storage.db import log_request
 from arcus.storage.stats import aggregate_by_arm_and_mode
 
@@ -37,7 +36,7 @@ def test_aggregates_correctly_across_models_and_modes():
     assert gpt_bandit.request_count == 2
     assert gpt_bandit.avg_reward == 0.7
     assert gpt_bandit.avg_latency_ms == 150
-    assert gpt_bandit.cost_score == COST_SCORES["gpt-oss-120b"]
+    assert gpt_bandit.judged_count == 0
 
     gpt_random = summaries[("gpt-oss-120b", "random")]
     assert gpt_random.request_count == 1
@@ -81,3 +80,29 @@ def test_missing_mode_grouped_as_unknown():
     summaries = aggregate_by_arm_and_mode(engine)
     assert len(summaries) == 1
     assert summaries[0].mode == "unknown"
+
+
+def test_judged_count_reports_how_many_rows_carry_a_grade():
+    engine = _in_memory_engine()
+
+    log_request(
+        prompt="a", task_type="code", length_bucket="short", model="gpt-oss-120b",
+        mode="bandit", reward=0.8, latency_ms=100, engine=engine,
+    )
+    graded = log_request(
+        prompt="b", task_type="code", length_bucket="short", model="gpt-oss-120b",
+        mode="bandit", reward=0.7, latency_ms=120, engine=engine,
+    )
+
+    from sqlmodel import Session
+    from arcus.storage.db import RequestLog
+
+    with Session(engine) as session:
+        row = session.get(RequestLog, graded.id)
+        row.judge_score = 0.9
+        session.add(row)
+        session.commit()
+
+    summary = {(s.model, s.mode): s for s in aggregate_by_arm_and_mode(engine)}[("gpt-oss-120b", "bandit")]
+    assert summary.request_count == 2
+    assert summary.judged_count == 1

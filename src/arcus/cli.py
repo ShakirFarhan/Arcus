@@ -20,7 +20,7 @@ from arcus.adapters.arc_adapter import ArcAdapter, ArcModel
 from arcus.cache.semantic_cache import lookup as cache_lookup
 from arcus.cache.semantic_cache import store as cache_store
 from arcus.config import ArcusConfig, BanditAlgorithm, config_path, load_config, save_config
-from arcus.embeddings import get_embedding_model
+from arcus.embeddings import embeddings_available, get_embedding_model
 from arcus.eval.offline import evaluate_policies, greedy_policy_from_log, load_logged_examples, policy_always
 from arcus.quality.gate import QualityIssue, call_with_quality_gate
 from arcus.quality.judge import should_judge
@@ -460,10 +460,24 @@ def _setup():
     config = _ensure_config()
     engine = get_engine()
     adapter = ArcAdapter(api_key=config.arc_api_key)
-    threading.Thread(target=get_embedding_model, daemon=True).start()
+    # only worth warming when it's actually installed, and a failure to
+    # load it shouldn't take a question down with it, the classifier and
+    # the cache both fall back on their own
+    if embeddings_available():
+        threading.Thread(target=_warm_embeddings, daemon=True).start()
     if config.enable_judge:
         _start_background_scoring(adapter, engine)
     return config, engine, adapter
+
+
+def _warm_embeddings() -> None:
+    try:
+        get_embedding_model()
+    except Exception:
+        # a missing or broken embedding model degrades the classifier to
+        # its regex rules and turns the cache into a permanent miss,
+        # neither of which is worth interrupting a question over
+        pass
 
 
 def _start_background_scoring(adapter: ArcAdapter, engine) -> None:
@@ -1036,7 +1050,7 @@ def run_stats() -> None:
     table.add_column("requests", justify="right")
     table.add_column("avg reward", justify="right")
     table.add_column("avg latency (ms)", justify="right")
-    table.add_column("cost score", justify="right")
+    table.add_column("graded", justify="right")
 
     for summary in aggregate_by_arm_and_mode(engine):
         table.add_row(
@@ -1045,7 +1059,7 @@ def run_stats() -> None:
             str(summary.request_count),
             f"{summary.avg_reward:.3f}" if summary.avg_reward is not None else "-",
             f"{summary.avg_latency_ms:.0f}" if summary.avg_latency_ms is not None else "-",
-            f"{summary.cost_score:.2f}" if summary.cost_score is not None else "-",
+            str(summary.judged_count) if summary.judged_count else "-",
         )
 
     console.print(table)
