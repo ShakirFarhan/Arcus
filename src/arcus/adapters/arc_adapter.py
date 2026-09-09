@@ -21,6 +21,44 @@ class ArcModel(str, Enum):
     DEEPSEEK_V4_FLASH = "DeepSeek-V4-Flash"
 
 
+# context windows per ARC's docs, in tokens. DeepSeek-V4-Flash is the
+# outlier at 512k and the only one that can take a genuinely large
+# input, which matters because piping a long file at this tool is
+# something the README actively suggests doing.
+#
+# Confirmed against the live API: an oversized request comes back as
+# `400 {"detail": "Input length (171067) exceeds model's maximum context
+# length (131072)."}`. That's a useful error, but by the time you have
+# it you've already shipped the whole payload, and the quality gate
+# would then try the next arm with the same too-large prompt. Knowing
+# the limits up front means never sending a request that cannot fit.
+MODEL_CONTEXT_TOKENS: dict[str, int] = {
+    ArcModel.GPT_OSS_120B.value: 131_072,
+    ArcModel.GLM_5_3.value: 131_072,
+    ArcModel.KIMI_K3.value: 131_072,
+    ArcModel.DEEPSEEK_V4_FLASH.value: 524_288,
+}
+
+
+def context_limit(model: str) -> int | None:
+    """Tokens `model` can accept, or None when it isn't known.
+
+    Variant ids (`-thinking-high`, `-legacy-tool-calling`) inherit from
+    the base model they're built on, since they're the same weights
+    served differently. Anything genuinely unrecognized returns None,
+    and callers should let it through rather than guess: refusing to
+    send a request over a limit that was invented here would be worse
+    than letting ARC answer for itself.
+    """
+    if model in MODEL_CONTEXT_TOKENS:
+        return MODEL_CONTEXT_TOKENS[model]
+
+    for base, limit in MODEL_CONTEXT_TOKENS.items():
+        if model.lower().startswith(base.lower()):
+            return limit
+    return None
+
+
 class ArcAdapter:
     """Thin wrapper around the openai SDK pointed at ARC's endpoint.
 

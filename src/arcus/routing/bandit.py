@@ -11,6 +11,7 @@ class Bandit(Protocol):
     def select_arm(self, exclude: set[str] | None = None) -> str: ...
     def update(self, arm: str, reward: float) -> None: ...
     def propensity(self, arm: str, exclude: set[str] | None = None) -> float: ...
+    def restore(self, arm: str, pulls: int, reward_sum: float) -> None: ...
 
 
 class _CountBasedBandit:
@@ -43,6 +44,18 @@ class _CountBasedBandit:
     def update(self, arm: str, reward: float) -> None:
         self._pulls[arm] += 1
         self._reward_sums[arm] += reward
+
+    def restore(self, arm: str, pulls: int, reward_sum: float) -> None:
+        """Sets this arm's state directly, as if `pulls` updates summing
+        to `reward_sum` had already been applied.
+
+        update() only ever accumulates a count and a sum, and both are
+        associative, so a run of updates is fully described by its
+        totals. That's what lets warm start ask the database to add the
+        history up instead of replaying it one row at a time.
+        """
+        self._pulls[arm] = pulls
+        self._reward_sums[arm] = reward_sum
 
     def _cold_start_propensity(self, arm: str, exclude: set[str] | None) -> float | None:
         # returns None once every candidate arm has at least one pull, so
@@ -165,6 +178,13 @@ class ThompsonSamplingBandit:
         self._alpha[arm] += reward
         self._beta[arm] += 1 - reward
 
+    def restore(self, arm: str, pulls: int, reward_sum: float) -> None:
+        # each update adds `reward` to alpha and `1 - reward` to beta, so
+        # after n of them alpha has grown by the reward total and beta by
+        # (n - that total). both start at the Beta(1, 1) prior.
+        self._alpha[arm] = 1.0 + reward_sum
+        self._beta[arm] = 1.0 + pulls - reward_sum
+
     def propensity(self, arm: str, exclude: set[str] | None = None) -> float:
         candidates = [a for a in self.arms if not exclude or a not in exclude]
         if arm not in candidates:
@@ -241,6 +261,9 @@ class ContextualBandit:
 
     def update(self, context_key: str, arm: str, reward: float) -> None:
         self._get_bandit(context_key).update(arm, reward)
+
+    def restore(self, context_key: str, arm: str, pulls: int, reward_sum: float) -> None:
+        self._get_bandit(context_key).restore(arm, pulls, reward_sum)
 
     def propensity(self, context_key: str, arm: str, exclude: set[str] | None = None) -> float:
         return self._get_bandit(context_key).propensity(arm, exclude=exclude)

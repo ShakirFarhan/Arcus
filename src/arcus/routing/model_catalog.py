@@ -4,7 +4,7 @@ from pathlib import Path
 
 from platformdirs import user_cache_dir
 
-from arcus.adapters.arc_adapter import ArcAdapter, ArcModel
+from arcus.adapters.arc_adapter import ArcAdapter, ArcModel, context_limit
 
 # model catalogs don't change often enough to justify a network call on
 # every single invocation, a few hours of staleness is a fine tradeoff
@@ -94,3 +94,25 @@ def filter_to_live(adapter: ArcAdapter, candidates: list[str]) -> list[str]:
 
     known = [candidate for candidate in candidates if candidate in live_ids]
     return known or candidates
+
+
+def filter_to_fitting(candidates: list[str], estimated_tokens: int) -> list[str]:
+    """Drops arms whose context window is too small for this input.
+
+    Sending a request that provably cannot fit wastes a full upload of
+    the payload, earns the model an undeserved penalty from the quality
+    gate, and then repeats on the next arm with the same oversized
+    prompt. Three of ARC's four models hold 128k and the fourth holds
+    512k, so a large input has exactly one place it can go, and there's
+    no reason to discover that the expensive way.
+
+    Models with no known limit are kept: refusing to send something over
+    a ceiling invented here would be worse than letting ARC answer for
+    itself. Returns an empty list when nothing fits, which callers must
+    handle rather than passing on to a bandit with no arms.
+    """
+    return [
+        candidate
+        for candidate in candidates
+        if (limit := context_limit(candidate)) is None or estimated_tokens <= limit
+    ]

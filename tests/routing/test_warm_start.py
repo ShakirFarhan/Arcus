@@ -1,6 +1,14 @@
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from arcus.routing.bandit import ContextualBandit, EpsilonGreedyBandit
+import pytest
+
+from arcus.routing.bandit import (
+    ContextualBandit,
+    EpsilonGreedyBandit,
+    RandomBandit,
+    ThompsonSamplingBandit,
+    UCB1Bandit,
+)
 from arcus.routing.warm_start import replay_history
 from arcus.storage.db import RequestLog, log_request
 
@@ -169,3 +177,100 @@ def test_replay_history_keeps_contexts_separate():
 
     assert code_bandit._pulls == {"gpt-oss-120b": 1, "GLM-5.3": 0}
     assert writing_bandit._pulls == {"gpt-oss-120b": 0, "GLM-5.3": 1}
+
+
+def _replay_row_by_row(bandit, engine, mode):
+    """The original implementation, kept as the reference the aggregated
+    one is checked against.
+    """
+    from arcus.storage.db import REWARD_VERSION
+
+    with Session(engine) as session:
+        rows = session.exec(
+            select(RequestLog)
+            .where(RequestLog.mode == mode)
+            .where(RequestLog.reward.is_not(None))
+            .where(RequestLog.reward_version == REWARD_VERSION)
+            .order_by(RequestLog.created_at)
+        ).all()
+    for row in rows:
+        context_key = f"{row.task_type}:{row.length_bucket}"
+        if row.model in bandit.arms_for(context_key):
+            bandit.update(context_key, row.model, row.reward)
+
+
+@pytest.mark.parametrize(
+    "algorithm",
+    [EpsilonGreedyBandit, UCB1Bandit, RandomBandit, ThompsonSamplingBandit],
+)
+def test_aggregated_replay_matches_row_by_row_exactly(algorithm):
+    """Warm start sums the history in SQL instead of applying it one row
+    at a time. That's only legitimate because every algorithm's state is
+    a pure function of (pull count, reward total) per arm, so this pins
+    the equivalence down rather than trusting the argument.
+    """
+    import random
+
+    engine = _in_memory_engine()
+    random.seed(11)
+    tasks = ["code", "writing", "general"]
+    lengths = ["short", "long"]
+
+    for i in range(400):
+        log_request(
+            prompt=f"q{i}",
+            task_type=random.choice(tasks),
+            length_bucket=random.choice(lengths),
+            model=random.choice(ARMS),
+            mode="bandit",
+            reward=round(random.random(), 6),
+            engine=engine,
+        )
+
+    def build():
+        return ContextualBandit(lambda _context_key: algorithm(ARMS), arms=ARMS)
+
+    reference, aggregated = build(), build()
+    _replay_row_by_row(reference, engine, "bandit")
+    replay_history(aggregated, engine, "bandit")
+
+    contexts = sorted(set(reference._bandits) | set(aggregated._bandits))
+    assert contexts, "the fixture should have produced several contexts"
+
+    for context_key in contexts:
+        a = reference._get_bandit(context_key)
+        b = aggregated._get_bandit(context_key)
+        if isinstance(a, ThompsonSamplingBandit):
+            assert a._alpha == pytest.approx(b._alpha)
+            assert a._beta == pytest.approx(b._beta)
+        else:
+            assert a._pulls == b._pulls
+            assert a._reward_sums == pytest.approx(b._reward_sums)
+
+
+def test_restore_reproduces_what_repeated_updates_would_have_built():
+    rewards = [0.2, 0.9, 0.55, 0.1]
+
+    updated = EpsilonGreedyBandit(ARMS)
+    for r in rewards:
+        updated.update("gpt-oss-120b", r)
+
+    restored = EpsilonGreedyBandit(ARMS)
+    restored.restore("gpt-oss-120b", len(rewards), sum(rewards))
+
+    assert updated._pulls == restored._pulls
+    assert updated._reward_sums == pytest.approx(restored._reward_sums)
+
+
+def test_thompson_restore_reproduces_its_posterior():
+    rewards = [0.3, 0.8, 0.65]
+
+    updated = ThompsonSamplingBandit(ARMS)
+    for r in rewards:
+        updated.update("GLM-5.3", r)
+
+    restored = ThompsonSamplingBandit(ARMS)
+    restored.restore("GLM-5.3", len(rewards), sum(rewards))
+
+    assert updated._alpha == pytest.approx(restored._alpha)
+    assert updated._beta == pytest.approx(restored._beta)

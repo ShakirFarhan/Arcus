@@ -1,4 +1,4 @@
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from arcus.routing.bandit import ContextualBandit
 from arcus.storage.db import REWARD_VERSION, RequestLog
@@ -10,36 +10,44 @@ def replay_history(bandit: ContextualBandit, engine, mode: str) -> None:
     Every `arcus` invocation is a fresh process, there's no daemon keeping
     the bandit alive in memory between runs. Without this, each run would
     start from a blank slate and the router would never actually learn
-    anything. It works because update() on all four algorithms is just an
-    associative accumulation of pull counts and reward sums, so replaying
-    the log in chronological order and feeding each row back through
-    update() lands on the same state as if the process had been running
-    continuously the whole time.
+    anything.
+
+    The work is pushed into a GROUP BY rather than replaying rows one at
+    a time. Every algorithm here accumulates exactly two things per arm,
+    a pull count and a reward total (Thompson's alpha and beta are just
+    those two rearranged), and both are associative, so the totals fully
+    describe the history that produced them. Summing 50k rows in SQL and
+    restoring four numbers is identical in result to calling update()
+    50k times, and doesn't get slower as the log grows: row-by-row replay
+    cost about 0.7s at 50k rows, on every single invocation, before the
+    request being asked about had even been sent.
     """
     with Session(engine) as session:
-        rows = session.exec(
-            select(RequestLog)
+        totals = session.exec(
+            select(
+                RequestLog.task_type,
+                RequestLog.length_bucket,
+                RequestLog.model,
+                func.count(RequestLog.id),
+                func.sum(RequestLog.reward),
+            )
             .where(RequestLog.mode == mode)
             .where(RequestLog.reward.is_not(None))
             # rewards from an older generation of the reward function
-            # aren't on the same scale as current ones, a pass/fail
-            # quality term scored every surviving response a flat 1.0
-            # where a graded one rarely does. replaying both together
-            # would hand the bandit an average of two different
-            # measurements, so only the current generation counts.
+            # aren't on the same scale as current ones, so averaging
+            # across generations would hand the bandit the mean of two
+            # different measurements.
             .where(RequestLog.reward_version == REWARD_VERSION)
-            .order_by(RequestLog.created_at)
+            .group_by(RequestLog.task_type, RequestLog.length_bucket, RequestLog.model)
         ).all()
 
-    for row in rows:
-        context_key = f"{row.task_type}:{row.length_bucket}"
-        if row.model not in bandit.arms_for(context_key):
-            # a model that was live and a valid arm for this context
-            # when the row was logged, but no longer is now, either ARC
-            # retired/renamed it, or (reasoning-effort variants) it was
-            # only ever an arm for this context under a config that's
-            # since been turned off. either way there's no arm to
-            # credit the reward to anymore, skip it rather than crash
-            # the whole replay over one stale row.
+    for task_type, length_bucket, model, pulls, reward_sum in totals:
+        context_key = f"{task_type}:{length_bucket}"
+        if model not in bandit.arms_for(context_key):
+            # a model that was live and a valid arm for this context when
+            # those rows were logged, but no longer is, either ARC
+            # retired or renamed it, or it was only ever an arm here
+            # under a config that's since been turned off. no arm to
+            # credit the reward to, so skip rather than crash the replay.
             continue
-        bandit.update(context_key, row.model, row.reward)
+        bandit.restore(context_key, model, pulls, float(reward_sum))

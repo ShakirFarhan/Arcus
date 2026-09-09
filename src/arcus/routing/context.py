@@ -186,12 +186,25 @@ def classify_task_type(text: str) -> TaskType:
     return result
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough chars-per-token estimate (~4), not a real tokenizer.
+
+    None of ARC's models use OpenAI's tokenizer, so an exact count here
+    would be fake precision. Measured against a real oversized request:
+    666,000 characters came back reported as 171,067 tokens, about 3.9
+    chars per token, so dividing by 4 lands a few percent low. That
+    direction is the safe one for the only decision this drives, which
+    is whether an input is too big for a model to accept: erring low
+    means a borderline request gets attempted rather than refused on the
+    strength of a guess made here.
+    """
+    return len(text) // 4
+
+
 def bucket_length(text: str) -> LengthBucket:
-    # rough chars-per-token estimate (~4), not a real tokenizer. none of
-    # ARC's four models use OpenAI's tokenizer anyway so an exact count
-    # would just be fake precision. these thresholds are a first guess,
-    # worth retuning once we have real query lengths to look at.
-    approx_tokens = len(text) // 4
+    # these thresholds are a first guess, worth retuning once we have
+    # real query lengths to look at.
+    approx_tokens = estimate_tokens(text)
 
     if approx_tokens < 100:
         return LengthBucket.SHORT

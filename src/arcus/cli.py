@@ -16,7 +16,7 @@ from rich.console import Console
 from rich.table import Table
 from sqlmodel import Session, select
 
-from arcus.adapters.arc_adapter import ArcAdapter, ArcModel
+from arcus.adapters.arc_adapter import ArcAdapter, ArcModel, context_limit
 from arcus.cache.semantic_cache import lookup as cache_lookup
 from arcus.cache.semantic_cache import store as cache_store
 from arcus.config import ArcusConfig, BanditAlgorithm, config_path, load_config, save_config
@@ -33,8 +33,8 @@ from arcus.routing.bandit import (
     ThompsonSamplingBandit,
     UCB1Bandit,
 )
-from arcus.routing.context import Context, TaskType, classify
-from arcus.routing.model_catalog import filter_to_live, known_arms
+from arcus.routing.context import Context, TaskType, classify, estimate_tokens
+from arcus.routing.model_catalog import filter_to_fitting, filter_to_live, known_arms
 from arcus.routing.warm_start import replay_history
 from arcus.storage.db import RequestLog, get_engine, log_request
 from arcus.storage.stats import aggregate_by_arm_and_mode
@@ -276,6 +276,31 @@ def _resolve_model_override(
     if model not in live_arms:
         return f"'{model}' isn't a model ARC is currently serving, valid choices: {', '.join(sorted(live_arms))}"
     return None
+
+
+def _arms_that_fit(arms: list[str], text: str, console: Console) -> list[str]:
+    """Narrows the arm list to models that can actually hold this input,
+    and stops outright when none can.
+
+    Piping a long file at this tool is something the README suggests, so
+    an oversized input isn't an edge case. Without this the quality gate
+    would ship the whole payload to a 128k model, get told it doesn't
+    fit, penalize that model for it, and then do the same thing again on
+    the next arm.
+    """
+    estimated = estimate_tokens(text)
+    fitting = filter_to_fitting(arms, estimated)
+    if fitting:
+        return fitting
+
+    biggest = max((context_limit(a) or 0) for a in arms) if arms else 0
+    console.print(
+        f"[red]that input is roughly {estimated:,} tokens, and the largest model here "
+        f"holds {biggest:,}.[/red]\n"
+        "[dim]nothing was sent. try a smaller slice of it, or use --doc to upload the "
+        "file so ARC retrieves from it instead of reading it all at once.[/dim]"
+    )
+    raise SystemExit(1)
 
 
 def _forced_arm_bandit(model: str, engine, mode: str = "manual") -> ContextualBandit:
@@ -538,7 +563,7 @@ def run_ask(prompt: str, random_mode: bool = False, model_override: str | None =
         bandit = _forced_arm_bandit(model_override, engine)
         mode = "manual"
     else:
-        arms = known_arms(adapter)
+        arms = _arms_that_fit(known_arms(adapter), prompt, console)
         algorithm_factory = RandomBandit if random_mode else _ALGORITHM_FACTORIES[config.bandit_algorithm]
         bandit = _build_bandit(arms, algorithm_factory, adapter, config.enable_reasoning_variants)
         # rebuild what this bandit already learned from past requests in

@@ -2019,3 +2019,77 @@ def test_setup_skips_background_grading_when_the_judge_is_off(monkeypatch):
     )
 
     cli._setup()
+
+
+# --- oversized input --------------------------------------------------------
+
+
+def test_an_input_too_large_for_any_model_is_refused_before_sending(monkeypatch, capsys):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(
+        cli, "classify", lambda text: Context(task_type=TaskType.CODE, length_bucket=LengthBucket.VERY_LONG)
+    )
+
+    class _Miss:
+        hit = False
+        response = None
+        model = None
+
+    monkeypatch.setattr(cli, "cache_lookup", lambda query, engine: _Miss())
+    monkeypatch.setattr(
+        cli, "call_with_quality_gate", lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("nothing should be sent when it cannot possibly fit")
+        )
+    )
+
+    # comfortably past DeepSeek's 512k window
+    with pytest.raises(SystemExit):
+        cli.run_ask("x" * 3_000_000)
+
+    out = capsys.readouterr().out
+    assert "largest model here holds" in out
+    assert "nothing was sent" in out
+
+
+def test_a_large_input_is_routed_only_to_models_that_can_hold_it(monkeypatch):
+    engine = _in_memory_engine()
+    monkeypatch.setattr(cli, "get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_ensure_config", lambda: ArcusConfig(arc_api_key="k"))
+    monkeypatch.setattr(cli, "ArcAdapter", lambda api_key: object())
+    monkeypatch.setattr(cli, "replay_history", lambda bandit, engine, mode: None)
+    monkeypatch.setattr(
+        cli, "classify", lambda text: Context(task_type=TaskType.CODE, length_bucket=LengthBucket.VERY_LONG)
+    )
+
+    class _Miss:
+        hit = False
+        response = None
+        model = None
+
+    monkeypatch.setattr(cli, "cache_lookup", lambda query, engine: _Miss())
+    monkeypatch.setattr(cli, "cache_store", lambda *a, **kw: None)
+
+    captured = {}
+
+    def _fake_gate(adapter, bandit, context_key, messages):
+        captured["arms"] = bandit.arms
+
+        class _Outcome:
+            response = _mock_completion("handled it")
+            model_used = "DeepSeek-V4-Flash"
+            passed = True
+            attempts = []
+            issues = []
+
+        return _Outcome()
+
+    monkeypatch.setattr(cli, "call_with_quality_gate", _fake_gate)
+
+    # ~175k tokens: past the 128k models, inside DeepSeek's 512k
+    cli.run_ask("y" * 700_000)
+
+    # the three that can't hold it are never even offered to the bandit
+    assert captured["arms"] == ["DeepSeek-V4-Flash"]

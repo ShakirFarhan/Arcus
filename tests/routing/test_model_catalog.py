@@ -114,3 +114,46 @@ def test_filter_to_live_shares_the_cache_with_known_arms(monkeypatch, tmp_path):
     filter_to_live(adapter, ["a-legacy-model"])
 
     assert len(calls) == 1
+
+
+# --- context-window filtering ----------------------------------------------
+
+ALL_FOUR = ["gpt-oss-120b", "GLM-5.3", "Kimi-K3", "DeepSeek-V4-Flash"]
+
+
+def test_a_small_input_can_go_to_any_model():
+    from arcus.routing.model_catalog import filter_to_fitting
+
+    assert filter_to_fitting(ALL_FOUR, 5_000) == ALL_FOUR
+
+
+def test_an_input_over_128k_only_fits_deepseek():
+    from arcus.routing.model_catalog import filter_to_fitting
+
+    # the exact size that produced ARC's "exceeds model's maximum context
+    # length (131072)" response against the live API
+    assert filter_to_fitting(ALL_FOUR, 171_067) == ["DeepSeek-V4-Flash"]
+
+
+def test_nothing_fits_past_the_largest_window():
+    from arcus.routing.model_catalog import filter_to_fitting
+
+    assert filter_to_fitting(ALL_FOUR, 600_000) == []
+
+
+def test_variant_ids_inherit_their_base_models_window():
+    from arcus.routing.model_catalog import filter_to_fitting
+
+    variants = ["gpt-oss-120b-thinking-high", "DeepSeek-V4-Flash-thinking-max"]
+    # same weights served differently, so the same ceiling applies
+    assert filter_to_fitting(variants, 171_067) == ["DeepSeek-V4-Flash-thinking-max"]
+
+
+def test_an_unrecognized_model_is_never_filtered_out():
+    from arcus.routing.model_catalog import filter_to_fitting
+
+    # refusing to send something over a limit invented here would be
+    # worse than letting ARC answer for itself
+    assert filter_to_fitting(["some-model-arc-added-later"], 9_000_000) == [
+        "some-model-arc-added-later"
+    ]
