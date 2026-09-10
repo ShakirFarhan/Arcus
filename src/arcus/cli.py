@@ -1,4 +1,6 @@
 import base64
+import csv
+import json
 import mimetypes
 import shlex
 import sys
@@ -17,6 +19,21 @@ from rich.table import Table
 from sqlmodel import Session, select
 
 from arcus.adapters.arc_adapter import ArcAdapter, ArcModel, context_limit
+from arcus.batch import state as batch_state
+from arcus.batch.command import (
+    CROSS_CHECK_FRACTION,
+    PREVIEW_ROWS,
+    cross_check_report,
+    estimate_runtime,
+    infer_choices,
+    pick_model,
+    render_preview,
+    resolve_output_path,
+    write_manifest,
+)
+from arcus.batch.io import BatchInputError, ResultWriter, guess_text_column, read_rows
+from arcus.batch.quality import sample_indexes
+from arcus.batch.runner import DEFAULT_CONCURRENCY, Aborted, run_batch
 from arcus.cache.semantic_cache import lookup as cache_lookup
 from arcus.cache.semantic_cache import store as cache_store
 from arcus.config import ArcusConfig, BanditAlgorithm, config_path, load_config, save_config
@@ -75,7 +92,7 @@ _COMPLETION_SCRIPTS = {
 _arcus_completions() {
     local cur=${COMP_WORDS[COMP_CWORD]}
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "chat stats eval judge models config --random --model --version --image --doc --web" -- "$cur"))
+        COMPREPLY=($(compgen -W "chat batch stats eval judge models config --random --model --version --image --doc --web" -- "$cur"))
     fi
 }
 complete -F _arcus_completions arcus
@@ -84,7 +101,7 @@ complete -F _arcus_completions arcus
 #compdef arcus
 _arcus() {
     if [ "$CURRENT" -eq 2 ]; then
-        compadd chat stats eval judge models config --random --model --version --image --doc --web
+        compadd chat batch stats eval judge models config --random --model --version --image --doc --web
     fi
 }
 _arcus
@@ -98,8 +115,8 @@ def main(argv: list[str] | None = None) -> None:
     `arcus "some question"` to just work with no subcommand at all, and a
     real subcommand parser (click underneath typer) fights that: it wants
     to treat the prompt text itself as an unrecognized command. `stats`,
-    `chat`, `models`, `config`, `eval`, and `judge` are the reserved words,
-    everything else is prompt text.
+    `chat`, `models`, `config`, `eval`, `judge`, and `batch` are the
+    reserved words, everything else is prompt text.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -130,6 +147,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if argv and argv[0] == "judge":
         run_judge()
+        return
+
+    if argv and argv[0] == "batch":
+        run_batch_command(argv[1:])
         return
 
     if argv and argv[0] == "chat":
@@ -388,6 +409,7 @@ def _build_prompt(args: list[str]) -> str:
 def _print_usage() -> None:
     Console().print(
         'usage: arcus "<question>" [--random | --model NAME] [--doc PATH | --web | --image PATH]\n'
+        "       arcus batch <file> \"<instruction>\"\n"
         "       arcus chat   or   arcus stats   or   arcus eval   or   arcus judge\n"
         "       arcus models   or   arcus config"
     )
@@ -984,6 +1006,260 @@ def run_chat(random_mode: bool = False, save_path: str | None = None) -> None:
     if save_path and transcript:
         _write_transcript(save_path, transcript)
         console.print(f"[dim]transcript saved to {save_path}[/dim]")
+
+
+
+def run_batch_command(args: list[str]) -> None:
+    """`arcus batch <file> "<instruction>"` and its overrides."""
+    console = Console()
+
+    column = _extract_flag_value(args, "--column")
+    out_flag = _extract_flag_value(args, "--out")
+    model_flag = _extract_flag_value(args, "--model")
+    choices_flag = _extract_flag_value(args, "--choices")
+    limit_flag = _extract_flag_value(args, "--limit")
+    concurrency_flag = _extract_flag_value(args, "--concurrency")
+    assume_yes = "--yes" in args or "-y" in args
+    no_cross_check = "--no-cross-check" in args
+
+    rest = [a for a in args if a not in ("--yes", "-y", "--no-cross-check")]
+    for flag in ("--column", "--out", "--model", "--choices", "--limit", "--concurrency"):
+        rest = _strip_flag_and_value(rest, flag)
+
+    if len(rest) < 2:
+        console.print(
+            '[red]usage: arcus batch <file> "<instruction>"[/red]\n'
+            "[dim]example: arcus batch survey.csv \"classify the sentiment as positive, "
+            "negative, or neutral\"[/dim]"
+        )
+        raise SystemExit(1)
+
+    input_path = Path(rest[0])
+    instruction = " ".join(rest[1:]).strip()
+
+    try:
+        columns, row_iter = read_rows(input_path)
+    except BatchInputError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1) from e
+
+    rows = list(row_iter)
+    if limit_flag:
+        rows = rows[: int(limit_flag)]
+    if not rows:
+        console.print(f"[red]'{input_path.name}' has a header but no rows.[/red]")
+        raise SystemExit(1)
+
+    if column is None:
+        column = guess_text_column(columns, rows[:20])
+        if column is None:
+            console.print(
+                f"[red]couldn't tell which column holds the text.[/red]\n"
+                f"[dim]columns: {', '.join(columns)} — pick one with --column[/dim]"
+            )
+            raise SystemExit(1)
+    elif column not in columns:
+        near = [c for c in columns if c.lower() == column.lower()]
+        hint = f" did you mean '{near[0]}'?" if near else ""
+        console.print(
+            f"[red]no column '{column}' in {input_path.name}.{hint}[/red]\n"
+            f"[dim]columns: {', '.join(columns)}[/dim]"
+        )
+        raise SystemExit(1)
+
+    choices = [c.strip() for c in choices_flag.split(",")] if choices_flag else infer_choices(instruction)
+    output_path = resolve_output_path(input_path, Path(out_flag) if out_flag else None)
+    concurrency = int(concurrency_flag) if concurrency_flag else DEFAULT_CONCURRENCY
+
+    config, _engine, adapter = _setup()
+    candidates = [model_flag] if model_flag else known_arms(adapter)
+    model = pick_model(adapter, rows, column, candidates)
+    if model is None:
+        console.print(
+            "[red]the largest row in this file is too big for any model here.[/red]\n"
+            "[dim]nothing was sent.[/dim]"
+        )
+        raise SystemExit(1)
+
+    console.print(f"\n  [bold]{input_path.name}[/bold] — {len(rows):,} rows, {len(columns)} columns")
+    console.print(f"  reading column: [bold]{column}[/bold]   [dim](change with --column)[/dim]")
+    if choices:
+        console.print(f"  answers must be one of: [bold]{', '.join(choices)}[/bold]")
+
+    # --- resume -------------------------------------------------------------
+    bengine = batch_state.get_engine()
+    fp = batch_state.fingerprint(input_path, instruction, column)
+    job = batch_state.find_job(bengine, fp)
+    resuming = False
+
+    if job is not None:
+        pending = batch_state.pending_indexes(bengine, job.id)
+        if pending and len(pending) < job.total_rows:
+            done = job.total_rows - len(pending)
+            if assume_yes or typer.confirm(
+                f"\n  found an unfinished run, {done:,} of {job.total_rows:,} already done. resume?",
+                default=True,
+            ):
+                rows = [r for r in rows if r.index in pending]
+                resuming = True
+            else:
+                batch_state.forget_job(bengine, job.id)
+                job = None
+        elif not pending:
+            batch_state.forget_job(bengine, job.id)
+            job = None
+
+    # --- preview ------------------------------------------------------------
+    if not resuming:
+        console.print(f"\n  trying {min(PREVIEW_ROWS, len(rows))} rows first...\n")
+        preview_rows = rows[:PREVIEW_ROWS]
+        preview: list = []
+        try:
+            with console.status("[dim]working...[/dim]"):
+                run_batch(
+                    adapter, model, preview_rows, instruction, column,
+                    choices=choices, concurrency=min(concurrency, len(preview_rows)),
+                    on_result=lambda r, p: preview.append(r),
+                )
+        except Aborted as e:
+            console.print(f"[red]{e}[/red]")
+            raise SystemExit(1) from e
+
+        preview.sort(key=lambda r: r.row.index)
+        render_preview(console, preview, column)
+
+        remaining = len(rows) - len(preview_rows)
+        console.print(f"  model: [bold]{model}[/bold]")
+        console.print(
+            f"  estimate: [bold]"
+            f"{estimate_runtime([r.latency_ms for r in preview], remaining, concurrency)}"
+            f"[/bold] for the remaining {remaining:,} rows\n"
+        )
+
+        if not assume_yes and not typer.confirm("  continue?", default=True):
+            console.print("[dim]stopped. nothing else was sent.[/dim]")
+            return
+
+        job = batch_state.create_job(
+            bengine,
+            fingerprint=fp,
+            input_path=str(input_path.resolve()),
+            output_path=str(output_path.resolve()),
+            instruction=instruction,
+            column=column,
+            model=model,
+            total_rows=len(rows),
+            choices=json.dumps(choices) if choices else None,
+        )
+        batch_state.register_rows(bengine, job.id, [r.index for r in rows])
+
+        for result in preview:
+            batch_state.record_result(
+                bengine, job.id, result.row.index,
+                status=batch_state.DONE if result.ok else batch_state.FAILED,
+                output=result.output, error=result.error, model=model, attempts=result.attempts,
+            )
+        rows = rows[len(preview_rows):]
+    else:
+        preview = []
+
+    # --- the run ------------------------------------------------------------
+    writer = ResultWriter(output_path, columns, ["result"], resuming=resuming)
+    for result in preview:
+        if result.ok:
+            writer.write(result.row, {"result": result.output})
+
+    primary_answers: dict[int, str] = {r.row.index: r.output for r in preview if r.ok}
+    last_line = {"n": 0}
+
+    def handle(result, progress) -> None:
+        batch_state.record_result(
+            bengine, job.id, result.row.index,
+            status=batch_state.DONE if result.ok else batch_state.FAILED,
+            output=result.output, error=result.error, model=model, attempts=result.attempts,
+        )
+        if result.ok:
+            writer.write(result.row, {"result": result.output})
+            primary_answers[result.row.index] = result.output
+
+        if progress.completed - last_line["n"] >= 10 or progress.completed == progress.total:
+            last_line["n"] = progress.completed
+            eta = progress.eta_seconds
+            suffix = f" · about {eta / 60:.0f}m left" if eta and eta > 90 else (
+                f" · about {eta:.0f}s left" if eta else ""
+            )
+            console.print(
+                f"  [dim]{progress.completed:,}/{progress.total:,} done"
+                f"{f' · {progress.failed} failed' if progress.failed else ''}{suffix}[/dim]"
+            )
+
+    try:
+        with console.status("[dim]running...[/dim]"):
+            run_batch(
+                adapter, model, rows, instruction, column,
+                choices=choices, concurrency=concurrency, on_result=handle,
+            )
+    except Aborted as e:
+        writer.close()
+        console.print(f"\n[red]{e}[/red]")
+        console.print("[dim]finished rows were saved. re-run the same command to resume.[/dim]")
+        raise SystemExit(1) from e
+    except KeyboardInterrupt:
+        writer.close()
+        console.print("\n[dim]stopped. re-run the same command to resume where it left off.[/dim]")
+        return
+    finally:
+        writer.close()
+
+    # --- cross-check --------------------------------------------------------
+    disagreements: list = []
+    second_model = None
+    if choices and not no_cross_check and len(primary_answers) >= 5:
+        others = [m for m in known_arms(adapter) if m != model]
+        second_model = pick_model(adapter, rows, column, others) if others else None
+        if second_model:
+            indexes = set(sample_indexes(len(rows), CROSS_CHECK_FRACTION))
+            to_check = [r for i, r in enumerate(rows) if i in indexes and r.index in primary_answers]
+            if to_check:
+                second: dict[int, str] = {}
+                console.print(f"\n  cross-checking {len(to_check)} rows against {second_model}...")
+                try:
+                    with console.status("[dim]cross-checking...[/dim]"):
+                        run_batch(
+                            adapter, second_model, to_check, instruction, column,
+                            choices=choices, concurrency=concurrency,
+                            on_result=lambda r, p: second.update({r.row.index: r.output} if r.ok else {}),
+                        )
+                    disagreements = cross_check_report(console, primary_answers, second, second_model)
+                except Aborted:
+                    console.print("[dim]cross-check skipped, connection refused.[/dim]")
+
+    # --- report -------------------------------------------------------------
+    final = batch_state.counts(bengine, job.id)
+    console.print(f"\n  [green]done[/green] — {final[batch_state.DONE]:,} rows → {output_path}")
+
+    failed = batch_state.failed_items(bengine, job.id)
+    if failed:
+        failed_path = output_path.with_name(f"{output_path.stem}.failed.csv")
+        with failed_path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["row", "error"])
+            for item in failed:
+                w.writerow([item.row_index + 1, item.error or ""])
+        console.print(f"  [yellow]{len(failed)} rows failed[/yellow] → {failed_path}")
+
+    if disagreements:
+        review_path = output_path.with_name(f"{output_path.stem}.review.csv")
+        with review_path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["row", "answer", "second_opinion"])
+            for index, a, b in disagreements:
+                w.writerow([index + 1, a, b])
+        console.print(f"  [yellow]{len(disagreements)} to review[/yellow] → {review_path}")
+
+    manifest_path = output_path.with_name(f"{output_path.stem}.manifest.json")
+    write_manifest(manifest_path, job, final)
+    console.print(f"  [dim]details → {manifest_path}[/dim]")
 
 
 def run_models() -> None:

@@ -19,8 +19,9 @@ through a shared server.
 arcus "explain how binary search works"
 ```
 
-**Contents:** [Why](#why) · [How it works](#how-it-works) · [Install](#install)
-· [Usage](#usage) · [Status](#status) · [Security & privacy](#security--privacy)
+**Contents:** [Why](#why) · [How it works](#how-it-works) · [Batch](#batch)
+· [Install](#install) · [Usage](#usage) · [Status](#status)
+· [Security & privacy](#security--privacy)
 
 ## Why
 
@@ -297,6 +298,87 @@ web-search answer that's since gone stale. See `src/arcus/cli.py`
 (`run_doc_ask`, `run_web_ask`) and `ArcAdapter.upload_file`/
 `delete_file` in `src/arcus/adapters/arc_adapter.py`.
 
+## Batch
+
+The one thing a browser genuinely can't do. Point it at a file with many
+rows, give it one instruction, get a new column back.
+
+```bash
+arcus batch survey.csv "classify the sentiment as positive, negative, or neutral"
+```
+
+```
+  survey.csv — 812 rows, 3 columns
+  reading column: response          (change with --column)
+  answers must be one of: positive, negative, neutral
+
+  trying 5 rows first…
+
+    row 1     The course was well organized but the pace was brutal
+               → positive
+    row 3     Honestly I struggled the entire semester
+               → negative
+
+  model: gpt-oss-120b
+  estimate: 2m to 7m for the remaining 807 rows
+
+  continue? [Y/n]
+```
+
+Same command shape for extraction ("pull out the sample size and the
+method"), triage ("is this a bug, a feature request, or a question"), or
+anything else that is one instruction repeated over many rows.
+
+**What it does that a thirty-line script doesn't:**
+
+- **Preview before committing.** Five real rows from your own file,
+  shown, before anything expensive starts. The most common expensive
+  mistake is a prompt that was subtly wrong, and this catches it for the
+  price of five requests rather than eight hundred.
+- **Resume.** Killed at row 4,000 of 10,000? Re-run the same command and
+  it picks up at 4,000. Finished rows are on disk the moment they finish,
+  never buffered to the end.
+- **One model throughout, never a fallback.** The router that runs
+  everywhere else in this tool is deliberately switched off here. A
+  dataset labelled half by one model and half by another has a confound
+  baked into it, so a row the chosen model can't answer is recorded as
+  failed rather than quietly handed to a different labeller.
+- **Answers are checked against the labels you named.** Models drift into
+  `Positive.` and `Sentiment: positive` and `**positive**` however firmly
+  you ask them not to, and at five thousand rows nobody notices until the
+  analysis is already wrong. Anything that can't be mapped is flagged,
+  never guessed.
+- **Sized to your biggest row.** Three of ARC's models hold 128k tokens
+  and one holds 512k, so the model is chosen against the largest row in
+  the file rather than a typical one. Otherwise a job discovers it picked
+  wrong at the end, after the waiting.
+- **Stays under ARC's cap.** Six concurrent by default, not the full ten,
+  so your own interactive `arcus` in another terminal keeps working while
+  a batch runs.
+- **A manifest.** `survey.labeled.manifest.json` records which model
+  answered, under which instruction, on which column, with what counts.
+  If you publish findings from machine-labelled data you will be asked
+  how it was labelled, and this answers it.
+
+**Cross-checking, and what it does and doesn't mean.** After a run, a
+sample of rows goes to a second model and the two answers are compared:
+
+```
+  cross-checked 160 rows against GLM-5.3: 94% matched
+  9 disagreed → survey.labeled.review.csv
+```
+
+Read that carefully. **Agreement between two language models is not
+accuracy.** Two human coders agreeing means something because their
+mistakes are independent; two models trained on overlapping text have
+correlated mistakes and can agree confidently while both being wrong.
+What disagreement *does* tell you is where the data is genuinely
+ambiguous, and those rows are the ones worth your own eyes. Turn it off
+with `--no-cross-check`.
+
+Overrides, all of them optional: `--column`, `--out`, `--choices`,
+`--model`, `--concurrency`, `--limit`, `--yes`, `--no-cross-check`.
+
 ## Install
 
 ```bash
@@ -335,9 +417,9 @@ ARC restricts the API to VT's campus network, so this (and every
 VPN. Arcus surfaces this as a clear message rather than the generic
 "no usable response" error when it happens.
 
-For tab completion on the `chat`/`stats`/`eval`/`judge`/`models`/
-`config`/`--random`/`--model`/`--image`/`--doc`/`--web` words, add one
-of these to your shell config:
+For tab completion on the `batch`/`chat`/`stats`/`eval`/`judge`/
+`models`/`config`/`--random`/`--model`/`--image`/`--doc`/`--web`
+words, add one of these to your shell config:
 
 ```bash
 # zsh, in ~/.zshrc
@@ -367,6 +449,9 @@ arcus --model GLM-5.3 "explain how binary search works"
 
 # see how it's doing
 arcus stats
+
+# label every row of a spreadsheet
+arcus batch survey.csv "classify the sentiment as positive, negative, or neutral"
 
 # compare the routing policy actually run against offline alternatives
 arcus eval
@@ -414,6 +499,7 @@ Quick reference, details for each are below:
 | `arcus --image PATH "<question>"` | Ask about an image (vision-capable model only). |
 | `arcus --doc PATH "<question>"` | Ask about an uploaded document (RAG). |
 | `arcus --web "<question>"` | Ask something needing current information (web search). |
+| `arcus batch <file> "<instruction>"` | Run one instruction over every row of a CSV or JSONL file. |
 | `arcus chat [--save PATH]` | Multi-turn conversation; `--doc`/`--web`/`--image`/`--model` all work inline per turn. |
 | `arcus stats` | Local routing performance so far. |
 | `arcus eval` | Offline comparison of the routing policy against alternatives. |
@@ -502,7 +588,7 @@ Live-tested against a real ARC key: all four models answer correctly
 run has gone through the real pipeline end to end, classification,
 cache miss, routing, an actual ARC call, the quality gate, logging,
 caching. Image input, document Q&A, and web search have each gotten a
-real run too. Test suite: 326 passing with a key set (322 + 4
+real run too. Test suite: 461 passing with a key set (457 + 4
 live-only), 4 skipped without one.
 
 Exception: reasoning-effort variant routing (`enable_reasoning_variants`)
