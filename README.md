@@ -285,12 +285,11 @@ rather than reimplementing them:
   account again once you have an answer. Works across all four core
   models, confirmed live against the real API.
 - **`arcus --web "question"`** routes to ARC's `server:websearch` tool
-  through three of its "legacy-tool-calling" model variants
-  (`gpt-oss-120b`, `Kimi-K3`, and the older `glm-52` variant) confirmed
-  to actually perform a real search and cite sources. A fourth,
-  DeepSeek's legacy variant, accepts the same request without erroring
-  but doesn't reliably act on it, live testing caught it answering a
-  time-sensitive question wrong with no citation, so it's left out.
+  through its "legacy-tool-calling" model variants. All four search:
+  measured over three trials each with an explicit search instruction,
+  every variant returned cited results. Worth knowing that a neutrally
+  phrased question sometimes gets answered from memory instead, on any
+  of them, which is a property of the prompt rather than the model.
 
 Both skip the semantic cache: a cached answer keyed on question text
 alone would risk answering about the wrong document, or serving a
@@ -524,13 +523,15 @@ below apply. The attachment only applies to that one turn, a later turn
 that wants to keep asking about the same document attaches it again.
 
 `arcus --image <path> "question"` attaches an image to a one-shot
-question. It always goes to Kimi-K3 rather than through the usual
-bandit comparison, confirmed directly against the API to be the only
-one of the four models that can actually see an image, GLM-5.3 and
-DeepSeek-V4-Flash both reject image content outright and gpt-oss-120b
-accepts the request but reports it can't see anything. Skips the
-semantic cache entirely too, matching on the question text alone would
-risk serving back an answer about a completely different image.
+question, routed only to the models measured to actually read one.
+Sending a solid red square and asking for the colour: Kimi-K3 and
+DeepSeek-V4-Flash both answered "Red"; GLM-5.3 refused honestly with
+`400 unsupported multimodal content`; **gpt-oss-120b returned a normal
+200 and answered "white"**. That last case is the reason this doesn't
+just go through the usual router, since a confident wrong answer is
+indistinguishable from a right one at the client. Skips the semantic
+cache too, matching on question text alone would risk serving back an
+answer about a completely different image.
 
 `arcus --doc <path> "question"` and `arcus --web "question"` work the
 same way as `--image`, cache skipped, see "Document Q&A and web search"

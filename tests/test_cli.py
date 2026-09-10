@@ -372,7 +372,9 @@ def test_run_image_ask_sends_image_content_to_the_vision_model_only(monkeypatch,
 
     cli.run_image_ask("what's wrong here?", str(image_path))
 
-    assert captured["arms"] == ["Kimi-K3"]
+    # measured: Kimi-K3 and DeepSeek-V4-Flash can both actually read an
+    # image, so both are offered rather than one being hardcoded
+    assert set(captured["arms"]) == set(cli.VISION_MODELS)
     sent_content = captured["messages"][0]["content"]
     assert sent_content[0]["text"] == "what's wrong here?"
     assert sent_content[1]["type"] == "image_url"
@@ -391,7 +393,7 @@ def test_run_image_ask_refuses_when_the_vision_model_is_unavailable(monkeypatch,
     with pytest.raises(SystemExit):
         cli.run_image_ask("what's wrong here?", str(image_path))
 
-    assert "isn't currently available" in capsys.readouterr().out
+    assert "can read images" in capsys.readouterr().out
 
 
 def test_run_image_ask_errors_cleanly_on_a_missing_file(monkeypatch, capsys):

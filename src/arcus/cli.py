@@ -58,25 +58,39 @@ from arcus.storage.stats import aggregate_by_arm_and_mode
 
 _ARC_DOCS_URL = "https://www.docs.arc.vt.edu/ai/011_llm_api_arc_vt_edu.html"
 
-# Kimi-K3 is the one model ARC's own docs describe as vision-capable
-# ("native multimodal understanding"), the other three aren't
-# documented either way, so image requests go straight to it rather
-# than through the usual multi-model bandit comparison. Confirmed
-# directly against the API: GLM-5.3 and DeepSeek-V4-Flash both reject
-# image content outright, gpt-oss-120b accepts the request but reports
-# it can't actually see the image.
-_VISION_MODEL = ArcModel.KIMI_K3.value
+# ARC's docs only ever demonstrate vision with Kimi-K3 and never say
+# which other models support it, so this was measured. Sending a solid
+# red square and asking for the colour:
+#
+#   Kimi-K3           "Red"                                  correct
+#   DeepSeek-V4-Flash "Red"                                  correct
+#   GLM-5.3           400 unsupported multimodal content     honest refusal
+#   gpt-oss-120b      200, answered "white"                  confidently wrong
+#
+# So two models can see, and the interesting case is gpt-oss: it neither
+# refuses like GLM nor answers correctly, it invents a description. From
+# a client's side that is indistinguishable from success, which is
+# exactly why image requests are restricted to the two that work rather
+# than left to the general router.
+VISION_MODELS = [ArcModel.KIMI_K3.value, ArcModel.DEEPSEEK_V4_FLASH.value]
+_VISION_MODEL = VISION_MODELS[0]
 
 # web search needs one of ARC's "legacy-tool-calling" model variants,
-# not the regular arms. DeepSeek's variant accepts the search tool_id
-# without erroring but doesn't reliably act on it (tested: answered a
-# time-sensitive question wrong, with no source citation, while the
-# other three got it right and cited sources), so it's left out here
-# until that's confirmed fixed on ARC's side.
+# not the regular arms. All four are listed in ARC's docs and all four
+# do search: re-measured over three trials each with an explicit
+# "search the web" instruction, every variant returned cited results.
+#
+# An earlier version of this list dropped DeepSeek on the strength of a
+# single test where it answered from memory instead of searching. That
+# reproduces on any of them if the question doesn't clearly call for a
+# search, GLM and Kimi both did it when asked neutrally, so it was a
+# property of the prompt rather than of the model, and excluding one
+# model over it was wrong.
 _WEB_SEARCH_MODELS = [
     "gpt-oss-120b-thinking-high-legacy-tool-calling",
     "Kimi-K3-thinking-max-legacy-tool-calling",
     "glm-52-thinking-high-legacy-tool-calling",
+    "DeepSeek-V4-Flash-thinking-max-legacy-tool-calling",
 ]
 
 _VALID_BANDIT_ALGORITHMS = get_args(BanditAlgorithm)
@@ -283,8 +297,11 @@ def _resolve_model_override(
     message to show the user, or None if the override is usable as-is.
     """
     if image_mode:
-        if model != _VISION_MODEL:
-            return f"--image only works with {_VISION_MODEL} right now, that's the one model confirmed to actually see an attached image."
+        if model not in VISION_MODELS:
+            return (
+                f"'{model}' can't read an attached image. "
+                f"measured to work: {', '.join(VISION_MODELS)}"
+            )
         return None
 
     if web_mode:
@@ -633,8 +650,9 @@ def run_image_ask(prompt: str, image_path: str, model_override: str | None = Non
         raise SystemExit(1) from e
 
     live_arms = known_arms(adapter)
-    if _VISION_MODEL not in live_arms:
-        console.print(f"[red]{_VISION_MODEL} isn't currently available for image requests.[/red]")
+    vision_arms = [m for m in VISION_MODELS if m in live_arms]
+    if not vision_arms:
+        console.print("[red]none of the models that can read images are available right now.[/red]")
         raise SystemExit(1)
 
     # the semantic cache has no concept of image content, matching only
@@ -642,7 +660,17 @@ def run_image_ask(prompt: str, image_path: str, model_override: str | None = Non
     # completely different image, so this skips the cache entirely
     # rather than mislead the way arcus chat's follow-up turns would.
     context = classify(prompt)
-    bandit = _forced_arm_bandit(_VISION_MODEL, engine, mode="bandit")
+    if model_override:
+        bandit = _forced_arm_bandit(model_override, engine, mode="bandit")
+    elif len(vision_arms) == 1:
+        bandit = _forced_arm_bandit(vision_arms[0], engine, mode="bandit")
+    else:
+        # two models can genuinely see, so let the router compare them
+        # instead of hardcoding a preference between them
+        bandit = ContextualBandit(
+            lambda _context_key: EpsilonGreedyBandit(vision_arms, epsilon=0.1), arms=vision_arms
+        )
+        replay_history(bandit, engine, mode="bandit")
 
     content, _, _, issues = _route_and_answer(
         adapter, bandit, context, prompt, [{"role": "user", "content": image_content}], "bandit", engine, console
