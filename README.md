@@ -5,302 +5,102 @@
 [![Python](https://img.shields.io/pypi/pyversions/arcus-cli.svg)](https://pypi.org/project/arcus-cli/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-A CLI for Virginia Tech ARC's LLM API that checks the answer before
-handing it to you. It validates every response for truncation, empty
-output, repetition loops and refusals, retries on a different model when
-one comes back broken, and skips the call entirely for questions it has
-already answered. It also routes between ARC's four models adaptively,
-though that part is instrumented rather than proven, see Status.
-
-Runs entirely on your own machine with your own ARC key. Nothing goes
-through a shared server.
+VT gives every student, researcher and staff member free access to four
+large language models through [ARC](https://llm.arc.vt.edu). Arcus is a
+command line client for it.
 
 ```bash
 arcus "explain how binary search works"
 ```
 
-**Contents:** [Why](#why) · [How it works](#how-it-works) · [Batch](#batch)
-· [Install](#install) · [Usage](#usage) · [Status](#status)
-· [Security & privacy](#security--privacy)
+It picks a model for you, checks the answer before showing it to you,
+and can run one instruction over a whole spreadsheet. Everything stays
+on your machine and talks only to ARC, with your own key.
 
-## Why
+[Install](#install) · [Commands](#commands) · [Batch](#batch) ·
+[How it picks a model](#how-it-picks-a-model) · [Privacy](#privacy) ·
+[Status](#status)
 
-ARC gives every VT user free access to four open-weight models
-(gpt-oss-120b, GLM-5.3, Kimi-K3, DeepSeek-V4-Flash) through one
-OpenAI-compatible endpoint ([ARC's own docs](https://www.docs.arc.vt.edu/ai/011_llm_api_arc_vt_edu.html)
-cover the service itself, including its rate limits and data-handling
-approval, arcus is a client built on top of it, not affiliated with
-ARC). Picking a model by hand every time is
-tedious, and a plain HTTP 200 doesn't tell you whether the response
-inside it was actually any good, a truncated answer or a flat refusal
-comes back looking the same as a correct one unless something reads the
-content. Arcus adds three things on top of the raw API:
+## Install
 
-- **A quality gate** — validates every response (truncation, empty
-  output, repetition loops, refusal phrases, schema conformance) before
-  it reaches you, and silently retries with a different model if the
-  first one produced garbage. A sample of the answers that pass is then
-  graded by a second model, so the router learns from how good a
-  response was rather than only whether it arrived intact.
-- **A correctness-aware cache** — skips the API call entirely for
-  questions it's answered before, but only when it's actually confident
-  the new question means the same thing as the cached one. Measured:
-  precision 0.306 → 1.000 against a labeled benchmark.
-- **Adaptive routing** — a multi-armed bandit learns, per kind of
-  question, which model gives the best result for the least delay.
-  Built and fully instrumented, but not yet shown to beat simply
-  picking one model, and the README says so rather than implying
-  otherwise.
-
-## How it works
-
-```
-your question (CLI arg or piped stdin)
-        |
-        v
-context classifier -- code / reasoning-math / writing / long-document / general
-        |
-        v
-semantic cache check -- hit? return the cached answer, skip everything below
-        | miss
-        v
-bandit router -- picks a model, one bandit instance per (task type, length) bucket
-        |
-        v
-ARC API call (your own key, OpenAI-compatible endpoint)
-        |
-        v
-quality gate -- validates the response, retries with a different model on failure
-        | pass
-        v
-answer to you + write to cache + reward logged back to the bandit
+```bash
+pip install arcus-cli
 ```
 
-Everything after "your question" runs locally. The only network call
-this tool ever makes is to ARC, with your own key.
+First run asks for your ARC key. Get one at
+[llm.arc.vt.edu](https://llm.arc.vt.edu) under **User profile →
+Settings → Account → API keys**. It's saved to
+`~/.config/arcus/config.toml` with `chmod 600`.
 
-### Context classification
+**You need to be on campus or on the VPN.** ARC restricts its API to
+VT's network. Arcus says so when that's the problem rather than leaving
+you guessing.
 
-Regex/keyword rules catch the obvious cases fast (a traceback is
-obviously a code question, "write me a poem" is obviously a writing
-request). Anything that doesn't match falls back to comparing the
-prompt's embedding against a small set of labeled anchor examples per
-category, so phrasing the regex rules never thought of still lands in
-the right bucket instead of defaulting to "general." See
-`src/arcus/routing/context.py`.
+Optional, and it adds about 750MB because it pulls in torch:
 
-### Adaptive routing
+```bash
+pip install 'arcus-cli[cache]'
+```
 
-Three interchangeable bandit algorithms, picked via config
-(`bandit_algorithm` in `~/.config/arcus/config.toml`, default
-`thompson`):
+That turns on the semantic cache, which skips the API call for questions
+you've already asked. Without it everything works the same, you just pay
+for repeat questions.
 
-- **Epsilon-greedy** — simplest baseline, explores randomly a fixed
-  fraction of the time.
-- **UCB1** — no tunable knob, explores under-tried arms automatically
-  via a confidence bound.
-- **Thompson sampling** — Bayesian, samples from each arm's learned
-  `Beta` distribution, the default because it adapts fastest early on.
+Tab completion:
 
-A random-selection baseline (`--random`) is also wired in as an A/B
-comparison point, mostly useful for the offline evaluation report below.
-The reward each arm is updated with mixes graded quality (0.6) with
-normalized latency (0.4). Both are measured from the request that
-actually happened. An earlier version carried a third term, a cost score
-derived from other providers' published rates for these same open-weight
-models; it was removed because ARC is free, nobody is billed those
-rates, and a fifth of every routing decision was being driven by a
-number describing a hypothetical deployment rather than this one. See
-`src/arcus/routing/bandit.py` and `src/arcus/routing/reward.py`.
+```bash
+eval "$(arcus --completion zsh)"    # or bash
+```
 
-Since every `arcus` invocation is a fresh process, there's no daemon
-holding the bandit's learned state in memory between runs. Instead,
-`src/arcus/routing/warm_start.py` rebuilds it at the start of every call
-by replaying the local request log, which works because a bandit's
-`update()` is just an associative accumulation of pull counts and reward
-sums.
+## Commands
 
-The four model ids arcus routes to live in `ArcModel`, but ARC runs its
-own model catalog independently and can rename or retire an entry at
-any time. `src/arcus/routing/model_catalog.py` checks the configured
-list against what ARC is actually serving (cached for a few hours so
-this doesn't cost a network round trip on every call) and quietly drops
-anything that's no longer live, rather than routing to a model
-guaranteed to fail. Local history logged under a since-renamed model id
-is skipped the same way when the bandit's state gets rebuilt.
+```bash
+# ask something
+arcus "why does my Django migration keep failing"
 
-Optionally, code, math, and long-document questions can route across
-ARC's `-thinking-*` reasoning-effort model variants too
-(`arcus config set enable_reasoning_variants true`, default off).
-Everyday questions stay on the fast base four either way. This is unit
-tested but hasn't run against a real ARC key from this environment.
-ARC's docs list these as separate catalog ids rather than a parameter
-on the base model, the same pattern already confirmed for web search's
-legacy-tool-calling variants below, but that's unverified here. Ask a
-code or math question after turning it on and confirm it actually
-answers before trusting it.
+# pipe an error straight in
+python broken.py 2>&1 | arcus
 
-### Quality gate
+# or pipe it with an instruction on top
+python broken.py 2>&1 | arcus "explain this like I'm new to async"
 
-Five independent checks run over every response: truncation
-(`finish_reason == "length"`), empty output, repetition (trigram
-duplication ratio), refusal-phrase matching, and optional Pydantic
-schema validation for structured-output requests. Any failure logs a
-negative reward for that model in that context and retries with a
-different one, up to once per available arm, before giving up and
-returning the last attempt. See `src/arcus/quality/gate.py`.
+# a conversation instead of one question
+arcus chat
+arcus chat --save notes.md
 
-ARC caps concurrent requests per account rather than per model, so a
-429 doesn't mean the model that was just called is bad, switching to a
-different arm wouldn't help either. A rate limit gets a few short
-retries against the same model before it's treated as a real failure,
-so one busy moment doesn't unfairly tank that model's learned reward.
+# ask about a file, an image, or something current
+arcus --doc syllabus.pdf "when is the midterm"
+arcus --image screenshot.png "what's wrong with this code"
+arcus --web "what's the newest stable Python release"
 
-Similarly, ARC's access restriction (see Install below) applies to the
-whole account, not one model, so hitting it stops the request
-immediately with a clear message instead of cycling through every arm
-against the same wall, and doesn't count against any model's reward.
+# pin a model instead of letting it choose
+arcus --model GLM-5.3 "explain covariance"
 
-### Graded quality, not just pass/fail
+# label an entire spreadsheet
+arcus batch survey.csv "classify the sentiment as positive, negative, or neutral"
+```
 
-Those five checks are structural. They catch a response that came back
-broken, but a confidently wrong answer sails through all of them, and if
-that scores the same as a correct one then the router is really only
-learning which model returns intact-looking text fastest.
+Inside `arcus chat` the flags work per turn:
 
-So a sample of the answers that clear the gate (one in four by default)
-gets sent to a second model for a 0-10 grade on how well it actually
-answered the question, and that grade replaces the flat 1.0 in the
-reward. Two things make this practical:
+```
+you: --doc paper.pdf what's the main claim here
+you: --web who won the game last night
+```
 
-- **It never runs inline.** The answer is already on your screen. The
-  row is marked as awaiting a grade, and the next `arcus` run grades a
-  few in the background while your new question is in flight. If the
-  process exits first, they stay queued for next time. `arcus judge`
-  clears the whole backlog on demand.
-- **Nothing grades its own work.** gpt-oss-120b judges by default,
-  being the cheapest and fastest, except when it wrote the answer, in
-  which case GLM-5.3 does it instead. A model scoring itself is a known
-  source of self-preference bias and would undercut every number
-  downstream of it.
+Housekeeping:
 
-A graded reward isn't comparable to a pass/fail one: the old scale gave
-every surviving response a perfect quality mark, so averaging the two
-together would hand the bandit the mean of two different measurements.
-Rows carry the reward generation that produced them, and anything that
-learns from the log (bandit warm start, `arcus eval`) reads only the
-current one. Upgrading is handled automatically, older rows are kept and
-still show up in `arcus stats`, they just stop feeding routing
-decisions. Turn the whole thing off with
-`arcus config set enable_judge false`.
-
-Honest limitation: the 75% that aren't sampled keep the provisional
-pass/fail score, so the signal is diluted by design, and LLM judges are
-known to compress toward the top of a scale. Both are reasons the
-per-model comparison in `arcus eval` should be read as directional until
-there's a lot more graded history behind it.
-
-### Semantic cache
-
-First, the obvious question: **ARC already caches, so why this?**
-Because they cache different things. ARC does prefix caching, reusing
-the computed attention state for a shared token prefix. Verified against
-the live API: sending an identical prompt three times reports 80 of 81
-prompt tokens served from cache and drops latency roughly 3x, but the
-completion token count differs every time (53, 48, 50), which means the
-*answer* is regenerated. ARC caches the computation; it never reuses the
-response, it still spends a request, and it still occupies one of your
-ten concurrent slots.
-
-Matching on meaning does something prefix caching structurally cannot.
-"when is project 2 due" and "when's project 2 due?" share almost no
-token prefix, so ARC's cache saves nothing, while this one returns
-instantly with no API call at all.
-
-Local `sentence-transformers` embeddings (`all-MiniLM-L6-v2`), cosine
-similarity lookup against everything stored so far. Two things keep it
-from just being a naive "similar enough, ship it" cache:
-
-- **Volatility classification** — a query containing words like
-  "today," "current," or "latest" gets a TTL of zero (never actually
-  served stale), stable conceptual questions get a week.
-- **Parameter-diff check** — before trusting a high-similarity match,
-  numbers and capitalized entities extracted from both queries are
-  compared. "when is project 2 due" and "when is project 3 due" read as
-  almost identical to a cosine similarity score, this check catches
-  that they're different questions.
-
-Measured against a 62-pair labeled benchmark of true paraphrases and
-near-duplicate-but-different prompts (`src/arcus/cache/benchmark.py`):
-
-| approach                  | precision | recall |
-| -------------------------- | --------- | ------ |
-| naive cosine similarity    | 0.306     | 0.688  |
-| + parameter-diff check     | 1.000     | 0.625  |
-
-The param-diff check trades some recall (it rejects a few pairs it
-shouldn't, "World War 1" vs "the First World War" gets flagged as a
-conflicting parameter, a known and documented limitation) for a real
-jump in precision, going from roughly 1-in-3 cache hits being wrong to
-zero false hits in this benchmark.
-
-### Offline policy evaluation and regret benchmarking
-
-Every request logs the propensity (the probability the routing policy
-assigned to whichever model it picked), which makes it possible to
-estimate how a *different* policy would have performed without ever
-running it live, using only the log that already exists. `arcus` logs
-propensity from the very first request, this can't be added
-retroactively to old data.
-
-`src/arcus/eval/offline.py` implements inverse propensity scoring (IPS)
-and doubly robust (DR) estimators plus percentile bootstrap confidence
-intervals, and `evaluate_policies()` produces a comparison table:
-the logged policy's actual average reward next to estimated values for
-any alternative policies you want to compare it against (e.g. "what if
-we'd always used gpt-oss-120b and never routed at all"). That last
-comparison is the one that decides whether the routing in this project
-is worth anything, which is why it's the first thing `arcus eval`
-prints once there's enough logged history to support it.
-
-`src/arcus/eval/regret.py` is a separate thing and worth being clear
-about: it's a **simulation**, not a measurement. Regret needs a known
-ground-truth reward per arm, which real traffic can never supply, since
-a real request only ever tries one model and you never learn what the
-other three would have scored. So it runs each algorithm against a
-synthetic environment with invented reward distributions. That's the
-standard way to study a bandit's exploration behavior in isolation, and
-it says nothing whatsoever about ARC or about these four models. Its
-numbers are deliberately not reproduced here, because a results table
-sitting next to the measured one above would invite exactly the
-confusion this paragraph exists to prevent.
-
-### Document Q&A and web search
-
-Both build directly on capabilities ARC's own API already provides,
-rather than reimplementing them:
-
-- **`arcus --doc <path> "question"`** uploads the file to ARC's RAG
-  endpoint, attaches it to the request, and deletes it from your ARC
-  account again once you have an answer. Works across all four core
-  models, confirmed live against the real API.
-- **`arcus --web "question"`** routes to ARC's `server:websearch` tool
-  through its "legacy-tool-calling" model variants. All four search:
-  measured over three trials each with an explicit search instruction,
-  every variant returned cited results. Worth knowing that a neutrally
-  phrased question sometimes gets answered from memory instead, on any
-  of them, which is a property of the prompt rather than the model.
-
-Both skip the semantic cache: a cached answer keyed on question text
-alone would risk answering about the wrong document, or serving a
-web-search answer that's since gone stale. See `src/arcus/cli.py`
-(`run_doc_ask`, `run_web_ask`) and `ArcAdapter.upload_file`/
-`delete_file` in `src/arcus/adapters/arc_adapter.py`.
+| | |
+|---|---|
+| `arcus stats` | what each model has been doing for you |
+| `arcus models` | what ARC is serving right now |
+| `arcus config` | show or change settings |
+| `arcus eval` | compare the routing against just picking one model |
+| `arcus judge` | grade any answers still waiting to be scored |
 
 ## Batch
 
-The one thing a browser genuinely can't do. Point it at a file with many
-rows, give it one instruction, get a new column back.
+This is the part a browser can't do. Point it at a file, give it one
+instruction, get a column back.
 
 ```bash
 arcus batch survey.csv "classify the sentiment as positive, negative, or neutral"
@@ -315,6 +115,7 @@ arcus batch survey.csv "classify the sentiment as positive, negative, or neutral
 
     row 1     The course was well organized but the pace was brutal
                → positive
+
     row 3     Honestly I struggled the entire semester
                → negative
 
@@ -324,312 +125,146 @@ arcus batch survey.csv "classify the sentiment as positive, negative, or neutral
   continue? [Y/n]
 ```
 
-Same command shape for extraction ("pull out the sample size and the
-method"), triage ("is this a bug, a feature request, or a question"), or
-anything else that is one instruction repeated over many rows.
+You get `survey.labeled.csv`, everything preserved with a `result`
+column added. The same shape works for extraction ("pull out the sample
+size and the method"), triage ("bug, feature request, or question"), or
+anything else that's one instruction repeated a lot.
 
-**What it does that a thirty-line script doesn't:**
+CSV and JSONL both work. Excel exports with their hidden byte-order mark
+work. Cells containing commas, quotes and line breaks come back intact.
 
-- **Preview before committing.** Five real rows from your own file,
-  shown, before anything expensive starts. The most common expensive
-  mistake is a prompt that was subtly wrong, and this catches it for the
-  price of five requests rather than eight hundred.
-- **Resume.** Killed at row 4,000 of 10,000? Re-run the same command and
-  it picks up at 4,000. Finished rows are on disk the moment they finish,
-  never buffered to the end.
-- **One model throughout, never a fallback.** The router that runs
-  everywhere else in this tool is deliberately switched off here. A
-  dataset labelled half by one model and half by another has a confound
-  baked into it, so a row the chosen model can't answer is recorded as
-  failed rather than quietly handed to a different labeller.
-- **Answers are checked against the labels you named.** Models drift into
-  `Positive.` and `Sentiment: positive` and `**positive**` however firmly
-  you ask them not to, and at five thousand rows nobody notices until the
-  analysis is already wrong. Anything that can't be mapped is flagged,
-  never guessed.
-- **Sized to your biggest row.** Three of ARC's models hold 128k tokens
-  and one holds 512k, so the model is chosen against the largest row in
-  the file rather than a typical one. Otherwise a job discovers it picked
-  wrong at the end, after the waiting.
-- **Stays under ARC's cap.** Six concurrent by default, not the full ten,
-  so your own interactive `arcus` in another terminal keeps working while
-  a batch runs.
-- **A manifest.** `survey.labeled.manifest.json` records which model
-  answered, under which instruction, on which column, with what counts.
-  If you publish findings from machine-labelled data you will be asked
-  how it was labelled, and this answers it.
+Things worth knowing:
 
-**Cross-checking, and what it does and doesn't mean.** After a run, a
-sample of rows goes to a second model and the two answers are compared:
+**It shows you five rows before doing the other 807.** The expensive
+mistake is a prompt that was subtly wrong, and five requests is a
+cheaper way to find that out than eight hundred.
+
+**You can kill it.** Rows are written as they finish. Ctrl-C at row
+4,000 of 10,000, run the same command again, and it carries on from
+4,000.
+
+**One model does the whole file.** The router that runs everywhere else
+is switched off here, because a dataset labelled half by one model and
+half by another has a problem baked into it that no analysis afterwards
+will fix. A row the model can't answer goes to
+`survey.labeled.failed.csv` rather than quietly to a different model.
+
+**Answers get checked against the labels you named.** Models reply
+`Positive.` and `Sentiment: positive` and `**positive**` however you ask
+them not to, and at five thousand rows nobody notices. Anything that
+can't be matched is flagged instead of guessed at.
+
+**Afterwards a second model looks at a sample:**
 
 ```
   cross-checked 160 rows against GLM-5.3: 94% matched
   9 disagreed → survey.labeled.review.csv
 ```
 
-Read that carefully. **Agreement between two language models is not
-accuracy.** Two human coders agreeing means something because their
-mistakes are independent; two models trained on overlapping text have
-correlated mistakes and can agree confidently while both being wrong.
-What disagreement *does* tell you is where the data is genuinely
-ambiguous, and those rows are the ones worth your own eyes. Turn it off
-with `--no-cross-check`.
+Read that as "here are the ambiguous rows", not as an accuracy score.
+Two models agreeing doesn't mean much, they've read a lot of the same
+text and tend to be wrong about the same things. Two models disagreeing
+does mean something, and those nine rows are worth your own eyes.
+`--no-cross-check` turns it off.
 
-Overrides, all of them optional: `--column`, `--out`, `--choices`,
-`--model`, `--concurrency`, `--limit`, `--yes`, `--no-cross-check`.
+You also get `survey.labeled.manifest.json` recording which model ran,
+under what instruction, over which column. If you publish anything based
+on machine-labelled data, someone will ask.
 
-## Install
+Overrides, all optional: `--column`, `--out`, `--choices`, `--model`,
+`--concurrency`, `--limit`, `--yes`, `--no-cross-check`.
 
-```bash
-pip install arcus-cli
-# or, with uv
-uv tool install arcus-cli
-```
+## How it picks a model
 
-Semantic caching is an optional extra, because it needs
-`sentence-transformers`, which pulls in torch and takes the install from
-about 115MB to roughly 865MB. Without it the cache reports every
-question as a miss and the context classifier falls back to its regex
-rules; everything else is unchanged.
+ARC serves four models — gpt-oss-120b, GLM-5.3, Kimi-K3 and
+DeepSeek-V4-Flash — and choosing between them by hand every time gets
+old. Arcus sorts your question into a category, then uses a multi-armed
+bandit to learn which model does best in that category, scoring answers
+on quality and speed.
 
-```bash
-pip install 'arcus-cli[cache]'
-```
+Two things make that more useful than it sounds.
 
-Or run from source:
+**It reads the answer before you do.** A 200 from the API says nothing
+about whether the thing inside it is any good. Arcus checks for
+truncation, empty responses, repetition loops and refusals, and quietly
+retries on another model when it finds one. A sample of the answers that
+pass then goes to a second model for a 0–10 grade, so what the router
+learns from is how good the answer was, not just that it arrived. That
+grading happens in the background on your next command, never while
+you're waiting.
 
-```bash
-git clone https://github.com/ShakirFarhan/Arcus.git
-cd Arcus
-uv sync
-uv run arcus "explain how binary search works"
-```
+**It knows what fits.** Three of the four models hold 128k tokens and
+DeepSeek holds 512k. Pipe a big log file in and it goes straight to the
+one that can take it, rather than failing three times first.
 
-First run walks you through a one-time setup: it asks for your ARC key
-(get one from `llm.arc.vt.edu` under User profile > Settings > Account
-> API keys), makes one live call to check it works, and saves it to
-`~/.config/arcus/config.toml` with `chmod 600`. No separate setup
-command to remember.
+Smaller things it deals with: ARC allows ten requests at a time per
+account and signals that in a way most clients misread, so Arcus backs
+off and retries instead of blaming the model. ARC renames models
+occasionally, so the model list is checked against what's actually being
+served. And a question you've asked before comes back from the local
+cache with no network call, but only when it's confident it really is
+the same question — "when is project 2 due" and "when is project 3 due"
+look nearly identical to a similarity score and are not the same
+question.
 
-ARC restricts the API to VT's campus network, so this (and every
-`arcus` call after it) needs either an on-campus connection or VT's
-VPN. Arcus surfaces this as a clear message rather than the generic
-"no usable response" error when it happens.
+For images, Kimi-K3 and DeepSeek-V4-Flash can read one, GLM-5.3 refuses
+cleanly, and gpt-oss-120b will confidently describe an image it cannot
+see. `--image` only goes to the two that work.
 
-For tab completion on the `batch`/`chat`/`stats`/`eval`/`judge`/
-`models`/`config`/`--random`/`--model`/`--image`/`--doc`/`--web`
-words, add one of these to your shell config:
+If you want the details: `src/arcus/routing/` for the bandit and model
+catalog, `src/arcus/quality/` for the checks and the grader,
+`src/arcus/batch/` for batch.
 
-```bash
-# zsh, in ~/.zshrc
-eval "$(arcus --completion zsh)"
+## Privacy
 
-# bash, in ~/.bashrc
-eval "$(arcus --completion bash)"
-```
-
-## Usage
-
-```bash
-# ask something directly
-arcus "explain how binary search works"
-
-# pipe an error straight in
-python broken.py 2>&1 | arcus
-
-# or combine piped context with an explicit instruction
-python broken.py 2>&1 | arcus "why is this failing"
-
-# force the random-routing baseline instead of the learned bandit policy
-arcus --random "explain how binary search works"
-
-# skip the bandit entirely and pin a specific model for this one call
-arcus --model GLM-5.3 "explain how binary search works"
-
-# see how it's doing
-arcus stats
-
-# label every row of a spreadsheet
-arcus batch survey.csv "classify the sentiment as positive, negative, or neutral"
-
-# compare the routing policy actually run against offline alternatives
-arcus eval
-
-# grade every answer still waiting on a quality judgement
-arcus judge
-
-# see every model ARC is currently serving, and which ones arcus routes to
-arcus models
-
-# hold a multi-turn conversation instead of a single question
-arcus chat
-
-# inside chat, --doc/--web/--image/--model all work inline, one
-# attachment per turn: "you: --doc paper.pdf summarize this"
-
-# save the conversation to a file when you leave
-arcus chat --save transcript.md
-
-# ask about an image (routes to Kimi-K3, the one ARC model documented
-# as vision-capable)
-arcus --image screenshot.png "what's wrong with this code?"
-
-# ask a question about a document, ARC handles the retrieval
-arcus --doc syllabus.pdf "when is the midterm?"
-
-# ask something that needs current information
-arcus --web "what's the latest release of Python?"
-
-# view or change local settings
-arcus config
-arcus config set bandit_algorithm ucb1
-
-# check which version is installed
-arcus --version
-```
-
-Quick reference, details for each are below:
-
-| Command | What it does |
-| --- | --- |
-| `arcus "<question>"` | Ask something, routed through the bandit + quality gate. |
-| `arcus --random "<question>"` | Same, but routes randomly instead of using the learned policy. |
-| `arcus --model NAME "<question>"` | Skip routing, pin one specific model. |
-| `arcus --image PATH "<question>"` | Ask about an image (vision-capable model only). |
-| `arcus --doc PATH "<question>"` | Ask about an uploaded document (RAG). |
-| `arcus --web "<question>"` | Ask something needing current information (web search). |
-| `arcus batch <file> "<instruction>"` | Run one instruction over every row of a CSV or JSONL file. |
-| `arcus chat [--save PATH]` | Multi-turn conversation; `--doc`/`--web`/`--image`/`--model` all work inline per turn. |
-| `arcus stats` | Local routing performance so far. |
-| `arcus eval` | Offline comparison of the routing policy against alternatives. |
-| `arcus judge` | Grade the backlog of answers still awaiting a quality score. |
-| `arcus models` | ARC's live model catalog vs. what arcus routes to. |
-| `arcus config [set ...]` | View or change local settings. |
-| `arcus --version` | Installed version. |
-
-`arcus chat` opens a REPL that remembers everything said earlier in that
-session (resending the growing transcript each turn, since ARC's API has
-no session concept of its own) and routes each turn through the same
-bandit/quality-gate/logging pipeline as a one-shot `arcus "..."` call.
-Type `exit` or press ctrl-d to leave. The conversation only lives for
-that one run, closing the terminal loses it, unless you pass `--save
-<path>`, which writes the full transcript (not just whatever's still in
-the trimmed context window) to a markdown file when you exit.
-
-`--doc PATH`, `--web`, `--image PATH`, and `--model NAME` all work
-inline inside `arcus chat` too, typed as part of a turn (`you: --doc
-paper.pdf summarize this`), one attachment per turn, the same rules as
-below apply. The attachment only applies to that one turn, a later turn
-that wants to keep asking about the same document attaches it again.
-
-`arcus --image <path> "question"` attaches an image to a one-shot
-question, routed only to the models measured to actually read one.
-Sending a solid red square and asking for the colour: Kimi-K3 and
-DeepSeek-V4-Flash both answered "Red"; GLM-5.3 refused honestly with
-`400 unsupported multimodal content`; **gpt-oss-120b returned a normal
-200 and answered "white"**. That last case is the reason this doesn't
-just go through the usual router, since a confident wrong answer is
-indistinguishable from a right one at the client. Skips the semantic
-cache too, matching on question text alone would risk serving back an
-answer about a completely different image.
-
-`arcus --doc <path> "question"` and `arcus --web "question"` work the
-same way as `--image`, cache skipped, see "Document Q&A and web search"
-above for what each actually does. Only one of `--image`, `--doc`, or
-`--web` can be used at a time.
-
-`arcus --model NAME "question"` skips the bandit entirely and always
-uses that model, checked against ARC's live catalog first. Since
-there's only one arm, the quality gate's checks (empty, truncated,
-repetitive, refusal) still run and still get reported, there's just no
-other model left to fall back to if it fails, that's the point of an
-explicit override. Combine with `--web` or `--image` and the name has
-to be one of the models valid for that mode.
-
-`arcus config` shows your current settings (the API key masked) and the
-path to the config file. `arcus config set bandit_algorithm <algo>`
-changes which bandit algorithm arcus uses without hand-editing the TOML
-file. `arcus config set enable_reasoning_variants <true|false>` turns
-the reasoning-effort routing described above on or off, and
-`arcus config set enable_judge <true|false>` turns response grading
-on or off. Re-keying isn't
-supported here on purpose, delete the config file and run `arcus` again
-to go through setup fresh.
-
-`arcus stats` reads your local SQLite log and prints a `rich`-formatted
-table: request count, average reward, average latency, and how many
-responses carry a quality grade, per model per mode, plus your cache hit
-rate and how many attempts the quality gate has caught and retried.
-Entirely local, no network call.
-
-`arcus eval` runs the offline policy evaluation described above against
-your own logged history and prints the comparison table (IPS and
-doubly-robust estimates with 95% confidence intervals for the greedy
-policy and each "always use model X" baseline, against what actually
-ran). Below 30 logged bandit-mode requests it still prints the table but
-flags the numbers as illustrative only, a bootstrap confidence interval
-on a handful of rows isn't a reliable comparison yet.
-
-`arcus judge` grades everything still queued for a quality score in
-one go, rather than the few each normal run picks off in the
-background. Worth running before `arcus eval` so the comparison sees
-every grade that's been earned.
+- Your key, your machine. Requests go to ARC and nowhere else.
+- Logs, cache and batch state are local SQLite. Nothing is uploaded,
+  aggregated or shared.
+- `--doc` uploads your file to your own ARC account and deletes it once
+  you have an answer. `--web` sends your question through ARC's search
+  tool. Both stay inside ARC, but a document leaving your laptop at all
+  is worth knowing about.
+- Batch keeps your rows locally while a job runs so it can resume.
+  They're yours to delete.
+- Arcus has not been through ARC's review for regulated data. ARC itself
+  has, this client hasn't. Don't put FERPA records or export-controlled
+  material through it.
 
 ## Status
 
-Everything above is built and working, adapter, context classification,
-all three bandit algorithms, the reward function, the quality gate, the
-semantic cache, the offline eval / regret code. The CLI covers all of
-it: asking directly (with an optional `--model` override), chat with
-inline attachments and transcript export, image/doc/web modes, config,
-stats, and eval.
+Working and in use: the ARC adapter, the quality checks, the grader, the
+semantic cache, batch, and the CLI around all of it. 457 tests, plus a
+few that only run when a real key is present.
 
-Live-tested against a real ARC key: all four models answer correctly
-(`tests/adapters/test_arc_adapter_live.py`), and a full `arcus "..."`
-run has gone through the real pipeline end to end, classification,
-cache miss, routing, an actual ARC call, the quality gate, logging,
-caching. Image input, document Q&A, and web search have each gotten a
-real run too. Test suite: 461 passing with a key set (457 + 4
-live-only), 4 skipped without one.
+Tested against the real API rather than only mocked: all four models
+answer, a full question runs end to end, and batch has been run over a
+file seeded with the kinds of rows that usually break CSV handling.
 
-Exception: reasoning-effort variant routing (`enable_reasoning_variants`)
-has only run against a fake adapter so far, which is why it defaults
-off. See "Adaptive routing" above.
+What isn't proven:
 
-ARC's models are reasoning models under the hood, they write to a
-hidden `reasoning` field before `content`, so a tight `max_tokens`
-budget can get eaten up before any real answer shows up. The CLI never
-sets `max_tokens` itself, so this doesn't affect normal usage, it only
-matters if you're calling the adapter directly with your own tight
-budget.
+- **The routing works, but nobody has shown it beats just picking one
+  model.** The machinery to find out is built — `arcus eval` runs
+  inverse-propensity and doubly-robust estimates with confidence
+  intervals — it needs more logged history than exists yet. Until then,
+  treat adaptive routing as a reasonable idea being measured, not a
+  proven win.
+- **Reasoning-effort routing is off by default.** ARC's docs list
+  `reasoning_effort` for all four models; in practice gpt-oss-120b and
+  GLM-5.3 respond to it and the other two ignore it. Turn it on with
+  `arcus config set enable_reasoning_variants true` if you want to
+  experiment.
+- ARC's models write hidden reasoning before their visible answer, so a
+  small `max_tokens` can be spent entirely on thinking. Arcus never sets
+  it, so this only bites if you use the adapter directly.
 
-Still open:
-
-- Real logged usage is thin (a handful of manual runs). `arcus eval`
-  runs today, it just doesn't have enough data yet, and says so
-  instead of faking confidence.
-- Reasoning-effort routing needs a live-key run before it's safe to
-  default on.
-
-## Security & privacy
-
-- Each install uses its own user's ARC key. Keys are never shared,
-  bundled, or sent anywhere but ARC's own endpoint.
-- No data leaves your machine except to ARC itself, with your own key.
-  Request logs, cache entries, and stats are all local SQLite, nothing
-  is aggregated or reported anywhere else.
-- `arcus --doc` uploads the whole file to your ARC account temporarily
-  (deleted again once you have an answer), and `arcus --web` sends your
-  question through ARC's own web search tool. Both stay within ARC,
-  same as every other request, but a document leaving your machine
-  entirely (even briefly, even to your own account) is worth knowing
-  about explicitly.
-- This tool hasn't been through ARC's security review for regulated
-  data (FERPA records, health data, etc.) the way ARC's own web
-  interface has. Don't route sensitive regulated data through it.
-- MIT licensed, source is fully readable, that's the actual trust
-  mechanism here rather than a policy document.
+`src/arcus/eval/regret.py` simulates the bandit algorithms against
+invented reward distributions. That's a standard way to study how an
+algorithm explores, and it says nothing about ARC or these models, so
+its numbers aren't reproduced here.
 
 ## License
 
-MIT, see `LICENSE`.
+MIT. Not affiliated with or endorsed by Virginia Tech ARC — it's a
+client built on a service they run. Their own documentation for the
+service is
+[here](https://www.docs.arc.vt.edu/ai/011_llm_api_arc_vt_edu.html).
